@@ -1,0 +1,35 @@
+JTTY in HF Digital Modes: a C port of the JTTY mode in WSJT-X Improved 3.2.1 (Uwe Risse DG2YCB's edition of WSJT-X;
+JTTY itself by Joe Taylor K1JT and the WSJT-X team, first in WSJT-X 3.2.0-rc1). GPL v3, as WSJT-X and as this app.
+
+Source: ws-3.2.1_261010.tgz from https://sourceforge.net/projects/wsjt-x-improved/files/WS_v3.2.1/Source%20code/
+(inner src/ws.tgz), lib/jtty/. WSJT-X's JTTY is Fortran, which the Android NDK cannot build, so it is ported by hand:
+
+  jtty_codec.c  <- jtty_source_codec.f90 (source atoms: pack, unpack, render), jtty_mod.f90 (pack_jtty: the fewest-
+                   frames dynamic program; normalize_jtty_message; unpack_jtty for one frame), lib/chkcall.f90, the
+                   ARRL section list of lib/77bit/packjt77_grammar.f90, and the standard-callsign part of packjt77's
+                   pack28 / unpack28 (through ft8_lib's pack_basecall, the same for standard calls).
+  jtty_fec.c    <- tbcc.f90 (CRC-12 and the tail-biting encoder), jtty_tbcc_list_decoder.f90 (the list WAVA decoder:
+                   its reference form, jtty_tbcc_list_wava_reference, which the optimised form reproduces; paths kept
+                   as 64-bit words instead of bit arrays), jtty_tbcc_decoder.f90 (the coherent-length ladder 1, 2, 4,
+                   then half-symbol energies; 4 hypotheses; CRC, reserved bit and the all-zero rule).
+  jtty_tx.c     <- genjtty.f90 (frames -> sync + coded tones), gen_jttywave.f90 + lib/gfsk_pulse.f90 (4-GFSK, BT 2.0).
+                   WSJT-X makes the audio at 48 kHz (1536 samples a symbol); here the same waveform at 12 kHz (384).
+                   The complex form uses cos / sin directly instead of WSJT-X's 65536-entry table.
+  jtty_rx.c     <- rjtty_sub.f90 (quarter-frame stepping over the growing buffer), jtty_mdecode.f90 (everything:
+                   sync-search surface with the Bluestein / full-FFT paths, channel 0 at the Rx frequency and channels
+                   1 / 2 at 1350 / 1650 Hz, peak-up, sticky-sync retry, subtraction, retro re-sweeps of the 3 previous
+                   quarter frames, duplicate rules, message assembly and its update queue), jtty_peakup.f90,
+                   jtty_payload_correlators.f90, subtract_jtty.f90, ana64a.f90, lib/twkfreq.f90.
+
+Differences from WSJT-X:
+- FFTs: ft8_lib's KISS FFT (single precision, unnormalised, the same signs as four2a) instead of FFTW.
+- The audio buffer slides (60 s, the oldest 30 s dropped when full) instead of WSJT-X's per-period buffer; times are
+  kept as seconds from the receiver's start, so dropping audio does not move them.
+- In the sync tone check, a symbol past the chunk's end leaves its hard decision unset (-1) rather than the previous
+  candidate's (Fortran keeps the stale value).
+- Not ported: the N1MM integration, MMTTY interface, Qt GUI, TCI audio and the research tools in lib/jtty/wava.
+
+Checked on a PC (tools/test/test_jtty.c): all ten 34-bit vectors of lib/jtty/jtty_source_encoding.txt unpack to their
+text, the seven with a text form pack to exactly those bits, and the frame counts of jtty_design.md's table all match;
+round trips with a second station overlapping decode whole messages down to -14 dB (2500 Hz), most at -16, pieces at
+-18 (WSJT-X: about -17 at best); the SNR reported matches the SNR set to about 1 dB.

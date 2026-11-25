@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HF Digital Modes: phones and tablets, portrait and landscape. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />           <!-- receive audio: the IC-705 over USB, or the microphone (asked on first use) -->
+    <uses-permission android:name="android.permission.INTERNET" />               <!-- later stages: PSK Reporter / WSPRnet spots, clock check, WiFi link to the IC-705 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />   <!-- online? -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />            <!-- RadioService: keeps the radio link running in the background -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" /> <!-- (its type: the IC-705) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />  <!-- (and the receive audio) -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />          <!-- (the connected-device type needs one of these; also binds to WiFi) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />            <!-- fallback floating PTT when accessibility is unavailable/restricted -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />            <!-- its notification -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" /> <!-- the IC-705's USB lead (not needed for the microphone) -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" /> <!-- tablets without one can still use the radio's audio -->
+
+    <application
+        android:name=".HamDigitalApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HamDigital">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- The IC-705 plugged in: Android offers to open the app (and "always" grants it the radio's USB). -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/usb_device_filter" />
+        </activity>
+        <!-- Keeps the radio link and receive audio running in the background (RadioService.kt) -->
+        <service
+            android:name=".RadioService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|microphone" />
+        <service
+            android:name=".ArchFloatingPttService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+        <service
+            android:name=".ArchOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <!-- Shares the logbook (ADIF) with other apps: e-mail, Drive, a logging program. -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.sharefiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>
+
+

@@ -1,0 +1,43 @@
+FT8CN's Icom network protocol (https://github.com/N0BOY/FT8CN, ft8cn/app/src/main/java/com/bg7yoz/ft8cn/icom, commit
+a98fbfa), MIT licence (LICENSE-FT8CN), (C) 2023 BG7YOZ. Made by tools/port_icom.py; the protocol code is unchanged.
+
+Copied: AudioUdp, ControlUdp, IComPacketTypes, IComWifiRig, IcomAudioUdp, IcomCivUdp, IcomControlUdp, IcomSeqBuffer,
+IcomUdpBase, IcomUdpClient, WifiRig (package com.bg7yoz.ft8cn.icom -> uk.hamdigital.icom). Not copied: the Xiegu classes.
+
+Changed (FT8CN's own app classes are not part of this app):
+  - IcomUdpBase.getUdpStyle: English stream names instead of FT8CN's string resources.
+  - IcomAudioUdp: no extra transmit-volume scaling (FT8CN's GeneralVariables.volumePercent; the app sets its level).
+  - IcomCivUdp.sendPttAction: the CI-V PTT frame (FE FE civ E0 1C 00 01/00 FD) built in place of FT8CN's IcomRigConstant.
+  - WifiRig: an OnStatus callback; IComWifiRig reports login and network errors through it instead of FT8CN's toasts,
+    and does not open the phone-speaker playback (openAudio): the radio's audio goes to the app's decoders.
+  - An unused checkerframework import removed.
+The app's side is uk.hamdigital.rig.IcomNet (connect / CI-V / PTT / audio) with Ic705, AudioIn and Transmitter.
+
+Fixed after the copy (0.8.5; found on the air - the radio kept a stale session after the app closed, so reopening the
+app gave no login, or a login with no CI-V, for a minute or two):
+  - IcomUdpClient.sendData: each packet is copied into its own SendDataRunnable and sent by a single-thread executor,
+    in order. FT8CN reused one shared runnable on a cached pool and overwrote its data before it ran, so packets sent
+    close together could be lost or duplicated.
+  - IcomUdpClient.setActivated(false): waits (up to 0.5 s) for the send queue to empty before turning off and closing
+    the socket. FT8CN closed it at once, so the disconnect / logout packets just queued were never sent ("Socket is
+    closed").
+  - IcomCivUdp.close: sends the CI-V open/close "close" before closing its socket (FT8CN sent it after).
+  - ControlUdp.closeAll: closes the CI-V and audio streams first, then deletes the token and disconnects the control
+    stream (as wfview does); FT8CN closed the control socket first and sent the CI-V close after the CI-V socket was
+    shut.
+
+Added (0.11.0, for FreeDV voice): IcomAudioUdp.pushTxAudio / startTxStream / stopTxStream - a queue of 12 kHz transmit
+samples and a thread that sends one 20 ms packet (TX_BUFFER_SIZE samples, packed as sendTxAudioData packs them) every
+20 ms while PTT is on, paced to the clock, silence when the queue is empty. FT8CN's sendTxAudioData sends one finished
+recording at a time and cannot take speech as it is made. sendTxAudioData itself is unchanged.
+
+Added (0.12.0, for FreeDV RADE): IcomAudioUdp.txQueued - how many samples are still queued, so the app can wait for the
+end of an over (RADE's end-of-over frame, with the callsign) to go out before it stops the stream and drops PTT.
+
+Changed (0.17.1, receive audio in sequence): IcomAudioUdp.onDataReceived no longer passes each audio packet on as it
+arrives. rxInOrder / rxRelease hold packets briefly by their sequence number (0x06), play them in order, ask the radio
+again for a missing one (a retransmit request: a control packet, type 0x01, with its sequence number - as wfview does,
+and as the "todo" comments in IcomUdpBase suggest), and if it still has not come when RX_HOLD (5) later packets are
+waiting, fill its time with silence. Counts (rxPackets, rxLost, rxRecovered, rxLate) are shown on each page's audio line.
+Why: SSTV pictures received over WiFi broke into bands, each shifted sideways - every lost packet shifted the timing of
+all the audio after it.

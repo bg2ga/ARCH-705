@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF00111F</color>               <!-- page background (as HF Propagation) -->
+    <color name="icon_bg">#FF0090B0</color>          <!-- launcher icon background (theme accent) -->
+</resources>
+

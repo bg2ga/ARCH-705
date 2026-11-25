@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/app/.cxx/
+/captures/
+.externalNativeBuild/
+.cxx/
+/keystore.properties
+# Release APKs (built files; rebuild with gradlew assembleRelease)
+/dist/
+/.kotlin/
+/tools/test/build/

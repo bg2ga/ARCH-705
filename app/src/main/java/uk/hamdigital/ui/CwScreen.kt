@@ -1,0 +1,165 @@
+// CW page: Morse from the IC-705's USB audio (or the microphone) through the decoder shared with HF Propagation and the
+// Tab5 (HamPropCore cw_decoder.cpp) - HF Propagation's CW decoder tool, as a full page: Pause / Listen, auto tune,
+// reset speed, clear; sensitivity, start speed, follow tone; a waterfall of the 14 tone bins (350-1000 Hz; tap a column
+// to lock on it); speed, tone and signal; the decoded text (copy / share); and sending with the IC-705's keyer (CI-V).
+package uk.hamdigital.ui
+
+import android.content.Intent
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
+import uk.hamdigital.MainViewModel
+import uk.hamdigital.core.Mode
+import uk.hamdigital.engine.CwNative
+import uk.hamdigital.rig.Ic705
+import uk.hamdigital.rig.IcomNet
+import uk.hamdigital.rig.RigState
+import androidx.compose.runtime.saveable.rememberSaveable
+import java.util.concurrent.atomic.AtomicBoolean
+
+private val CW_SPD = listOf(12f, 18f, 25f, 30f)       // start speeds offered
+private val CW_TX_WPM = listOf(15, 20, 25, 30)         // keyer speeds offered
+
+@Composable
+fun CwScreen(vm: MainViewModel) {
+    val ctx = LocalContext.current; val clip = LocalClipboardManager.current
+    val s by vm.settings.collectAsStateWithLifecycle() // the audio choice
+    val paused = remember { AtomicBoolean(false) }    // audio ignored while paused
+    var listening by remember { mutableStateOf(true) } // (the button)
+    val rx = rememberRx(16000, 256, s.audio) { b, n -> if (!paused.get()) CwNative.process(b, n) } // 16 kHz, 16 ms blocks, as the Tab5
+    LaunchedEffect(Unit) {
+        while (true) {
+            if (Ic705.state.value.link == RigState.Link.CONNECTED &&
+                (IcomNet.scope.value == null || !IcomNet.scopeFresh())) Ic705.requestScope()
+            delay(1000)
+        }
+    }
+    var st by remember { mutableStateOf(CwNative.state()) } // the decoder's state
+    var text by remember { mutableStateOf(CwNative.text()) }; var sym by remember { mutableStateOf("") } // transcript, letter in progress
+    LaunchedEffect(Unit) {
+        while (true) {
+            st = CwNative.state()
+            text = CwNative.text()
+            sym = CwNative.symbol()
+            delay(80)
+        }
+    }
+    val locked = st[0] > 0.5f; val toneOn = st[1] > 0.5f; val follow = st[8] > 0.5f
+    val conf = LocalConfiguration.current
+    val wide = conf.screenWidthDp >= 600              // controls beside the waterfall
+    val sideways = conf.screenWidthDp > conf.screenHeightDp && conf.screenHeightDp < 480 // a phone on its side: the text gets its own column
+    val gate = rememberTxGate(vm)                       // the licence notice before transmitting
+    var txWpm by rememberSaveable { mutableIntStateOf(20) } // keyer speed
+    var txMsg by remember { mutableStateOf("") }       // why sending did not start
+    LaunchedEffect(Unit) { while (true) { Ic705.askBreakIn(); delay(5000) } } // the radio's break-in setting, kept up to date while the page is open
+    var logging by remember { mutableStateOf<uk.hamdigital.core.Qso?>(null) } // the log form, open
+    val log = { logging = newQso("CW", s) }            // Log: a new contact, filled in from the radio
+    // Send [t] with the IC-705's own keyer (CI-V): the radio keys itself in CW with break-in on.
+    fun sendCw(t: String) = gate.ask {
+        txMsg = when {
+            s.callsign.isBlank() -> "请先在设置中填写呼号"
+            Ic705.state.value.link != RigState.Link.CONNECTED -> "IC-705 控制链路未连接"
+            uk.hamdigital.core.PttLock.locked.value -> "PTT 已锁定，请先解锁"
+            else -> if (Ic705.sendCwMessage(t, txWpm)) {
+                CwNative.control(0, 0f)
+                "CW 发送已启动：电台将自动进入 CW 和半插入模式"
+            } else "CW 发送未启动，请检查 PTT 锁或电台状态"
+        }
+    }
+    ModeFrame("CW", { vm.back() }, actions = {
+        TextButton({ clip.setText(AnnotatedString(text)) }) { uk.hamdigital.ui.Text("Copy", color = Pal.Text2) } // the transcript
+        TextButton({ ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Share the decoded text")) }) { uk.hamdigital.ui.Text("Share", color = Pal.Text2) }
+        if (sideways) TextButton(log) { uk.hamdigital.ui.Text("Log", color = Pal.Text2) } // (on its side the send box, with its Log chip, is not shown)
+    }) {
+        RxStatus(rx)                                  // audio, level
+        RigBar(Mode.CW) // radio frequency/mode, bands, and direct frequency entry
+        val controls: @Composable () -> Unit = {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { // the main controls
+                Button({ listening = !listening; paused.set(!listening) }, colors = ButtonDefaults.buttonColors(containerColor = if (listening) Pal.Red else Color(0xFF1F8A4C))) { uk.hamdigital.ui.Text(if (listening) "Pause" else "Listen") }
+                OutlinedButton({ CwNative.control(1, 0f) }, contentPadding = PaddingValues(horizontal = 10.dp)) { uk.hamdigital.ui.Text("Auto tune", fontSize = 13.sp) }
+                OutlinedButton({ CwNative.control(2, 0f) }, contentPadding = PaddingValues(horizontal = 10.dp)) { uk.hamdigital.ui.Text("Reset speed", fontSize = 13.sp) }
+                OutlinedButton({ CwNative.control(0, 0f); text = "" }, contentPadding = PaddingValues(horizontal = 10.dp)) { uk.hamdigital.ui.Text("Clear", fontSize = 13.sp) }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) { // sensitivity, follow tone
+                uk.hamdigital.ui.Text("Sensitivity", color = Pal.Muted, fontSize = 13.sp)
+                Slider(st[6], { CwNative.control(4, it); st = CwNative.state() }, Modifier.weight(1f).padding(horizontal = 8.dp).then(if (sideways) Modifier.height(32.dp) else Modifier))
+                SmallChip(if (follow) "Follow tone: on" else "Follow tone: off", follow) { CwNative.control(6, if (follow) 0f else 1f); st = CwNative.state() }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) { // start speed
+                uk.hamdigital.ui.Text("Start speed", color = Pal.Muted, fontSize = 13.sp)
+                CW_SPD.forEach { w -> SmallChip("${w.toInt()} WPM", kotlin.math.abs(st[7] - w) < 0.5f) { CwNative.control(5, w); CwNative.control(2, 0f); st = CwNative.state() } }
+            }
+        }
+        val rfScope: @Composable (Modifier) -> Unit = { m ->
+            IcomScopePanel(
+                modifier = m.then(if (sideways) Modifier.fillMaxHeight() else Modifier.height(190.dp)),
+                showHeader = true,
+                showLabels = false,
+                spanText = "实时频谱",
+                onFrequencyTap = { hz ->
+                    if (Ic705.state.value.link == RigState.Link.CONNECTED && !Ic705.state.value.tx && !busyTransmitting()) Ic705.setFrequency(hz)
+                },
+            )
+        }
+        val status = when { !rx.running -> "No audio"; !listening -> "Paused - tap Listen"; else -> when {
+            !locked -> "正在自动搜索 CW 音调…"; toneOn -> "Receiving"; else -> "Locked - waiting for the next letter" } } // what it is doing
+        val tone = if (!locked) "Tone: searching" else if (st[5] > 0f) "Tone %.0f Hz  •  %.0f dB above the noise".format(st[4], st[5]) else "Tone %.0f Hz".format(st[4]) // (no dB until a mark is decoded on this tone)
+        val numbers: @Composable (Modifier) -> Unit = { m ->
+            Column(m) {
+                uk.hamdigital.ui.Text(if (locked) "%.0f WPM".format(st[3]) else "-- WPM", color = Pal.Cyan, fontWeight = FontWeight.Bold, fontSize = 26.sp) // speed
+                uk.hamdigital.ui.Text(tone, color = Pal.Text, fontSize = 14.sp)                          // tone, signal
+                uk.hamdigital.ui.Text(status, color = Pal.Amber, fontSize = 13.sp)                       // what it is doing
+                uk.hamdigital.ui.Text(sym, color = Pal.Text, fontWeight = FontWeight.Bold, fontSize = 20.sp) // the letter in progress
+            }
+        }
+        val numbersSmall: @Composable () -> Unit = {  // on its side: the same on two short lines
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                uk.hamdigital.ui.Text(if (locked) "%.0f WPM".format(st[3]) else "-- WPM", color = Pal.Cyan, fontWeight = FontWeight.Bold, fontSize = 20.sp) // speed
+                Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                    uk.hamdigital.ui.Text(tone, color = Pal.Text, fontSize = 12.sp, maxLines = 1)        // tone, signal
+                    uk.hamdigital.ui.Text(status, color = Pal.Amber, fontSize = 12.sp, maxLines = 1)     // what it is doing
+                }
+                uk.hamdigital.ui.Text(sym, color = Pal.Text, fontWeight = FontWeight.Bold, fontSize = 18.sp) // the letter in progress
+            }
+        }
+        val textBox: @Composable (Modifier) -> Unit = { m -> // the decoded text
+            Surface(color = Color(0xFF111820), shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp), modifier = m) {
+                val sc = rememberScrollState(); LaunchedEffect(text.length) { sc.animateScrollTo(sc.maxValue) } // keep the newest in view
+                SelectionContainer { uk.hamdigital.ui.Text(text.ifEmpty { "The decoded text appears here. Tune the IC-705 to a CW signal (CW mode, or USB with the tone at 350-1000 Hz)." },
+                    Modifier.verticalScroll(sc).padding(10.dp), color = if (text.isEmpty()) Pal.Dim else Pal.Text, fontSize = 20.sp, lineHeight = 26.sp) }
+            }
+        }
+        if (sideways) Row(Modifier.fillMaxSize().padding(bottom = 6.dp)) { // on its side: everything on one screen
+            Column(Modifier.weight(1f).fillMaxHeight()) { controls(); rfScope(Modifier.weight(1f).padding(top = 4.dp)) }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f).fillMaxHeight()) { numbersSmall(); textBox(Modifier.fillMaxWidth().weight(1f)) }
+        } else {
+            controls()
+            if (wide) Row(Modifier.padding(vertical = 6.dp)) { rfScope(Modifier.weight(1f)); Spacer(Modifier.width(12.dp)); numbers(Modifier.weight(1f)) }
+            else { rfScope(Modifier.padding(vertical = 6.dp)); numbers(Modifier) }
+            textBox(Modifier.fillMaxWidth().weight(1f).padding(vertical = 6.dp))
+            SendBox(s.callsign, "CW", ::sendCw, onLog = log) { // typing and sending (the IC-705's keyer); Log
+                CW_TX_WPM.forEach { w -> SmallChip("$w WPM", w == txWpm) { txWpm = w; Ic705.setCwSpeed(w) } }
+                SmallChip("Stop", false) { Ic705.stopCw() }
+            }
+            if (txMsg.isNotEmpty()) uk.hamdigital.ui.Text(txMsg, color = Pal.Red, fontSize = 12.sp) // why it did not send
+        }
+    }
+    logging?.let { QsoEditor(it, true) { logging = null } } // the log form, over the page (decoding carries on)
+}

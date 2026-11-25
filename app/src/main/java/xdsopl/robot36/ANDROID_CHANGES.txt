@@ -1,0 +1,48 @@
+Robot36 (Ahmet Inan, 0BSD - LICENSE) in HF Digital Modes, for SSTV receive.
+
+Source: https://github.com/xdsopl/robot36 at commit 2af2390 (2026-10-03).
+
+The decoder's classes (Decoder, Demodulator, the modes and the filters they use) are copied unchanged; Robot36's
+activity, audio sources, file readers and settings are not used. SstvDecoder.java is the app's own (GPL v3, as the
+app): it sits in this package because Decoder's constructor and current mode are package-private, and holds the two
+pixel buffers as Robot36's MainActivity does.
+
+SstvDecoder (ours, not Robot36's) now sets the decoder's starting mode to a RawDecoder named "Raw": Robot36 starts in
+Robot 36, so the app could not tell "a Robot 36 picture found from its line timing" from "nothing found yet".
+Robot36's own files are still unchanged.
+
+VisFinder.java (ours, GPL v3) is a second VIS (start code) search for weak HF signals, and Decoder.java is changed to
+use it - the only change to Robot36's own files:
+- Off air the 10 ms break and the start bit of the header were nearly always lost: Robot36 reads the header through
+  its FM demodulator (the strongest thing in 1000-2800 Hz), which reads garbage once noise is within a few dB of the
+  tones, worst at the low header tones. So pictures only started from the line timing, with the top lost.
+- VisFinder tracks the strongest single tone (a 30 ms FFT every 1 ms) on the raw audio and looks for a steady leader,
+  8 code bits and the stop bit, relative to the leader (mistuning up to 200 Hz); one unreadable bit is given back by
+  the parity. It needs neither the break nor the start bit.
+- Decoder: process() gives VisFinder the raw audio before the demodulator overwrites it; handleHeader's second half is
+  split out as startPicture() (unchanged, but no red lines for an unknown code from VisFinder); handleHeaderFallback()
+  starts VisFinder's header when Robot36's own search did not; a started picture holds VisFinder off for a second.
+Checked on 10 off-air recordings (2026-10-11): 4 headers found (Robot 36 x1, Scottie 1 x3) where Robot36 found none.
+
+0.18.2: Decoder clears the picture to black when one starts (startPicture), and the scan-line scope when its line
+timing finds a new picture (processSyncPulse, pictureChanged): Robot36 left the last picture there, so the app showed
+the new one slowly overwriting the old.
+
+0.20.1: a picture found from its line timing (processSyncPulse, pictureChanged to a mode other than Raw, no picture in
+progress) is started like one with a VIS code - image buffer sized, line 0, cleared - so it is drawn top-down and
+finishes like one (the app then keeps it if most of its lines came with their own sync pulses). Counters for that:
+startedByTiming, syncedLines (lines placed by a sync pulse), picLines (lines copied into the picture).
+
+0.20.2: slant. A picture in progress (processSyncPulse) and mode detection by line timing (detectMode) allow the measured
+line length to be within 1 % of the mode's (slantTolerance), not just Robot36's fixed 1 ms. A sound card a little fast
+or slow makes every line longer or shorter; past 1 ms (0.36 % in Scottie 2, 0.1 % in the longest modes) every sync was
+refused and the picture carried on at the nominal length, slanting. Checked by resampling an off-air Scottie 2: at
+0.5 % it slanted badly (1 % of its syncs used); now straight to 0.8 % either way (77-81 % used).
+
+0.20.3: line tracking from every sync pulse (trackSync). On the user's USB recordings the slant was not a refused
+line length: the lines were right (~0.23 % long), but most sync pulses were lost or measured at the wrong width (a 9 ms
+Scottie sync filed as 5 / 20 ms), so Robot36's "four lines in a row agree" never held and the picture ran on at the
+nominal length. Now, inside a picture, every detected pulse (any width) within 5 % of a line of the grid (then 4 ms of
+the fit) joins a least-squares fit of pulse position against line number; its slope sets the line length and it
+places the next line's start. The fit's positions move with shiftSamples. EA4ADJ's Scottie 2 and EC7C's Martin 2 (off
+air, USB) came out straight and whole instead of torn diagonals; the other recordings decode as before.

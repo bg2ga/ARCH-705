@@ -1,0 +1,235 @@
+// FT8 / FT4 / FT2 slot decoder on ft8_lib (Kārlis Goba, MIT), without JNI (ft8_jni.c calls it; a PC test can too): decodes one FT8 (15 s), FT4 (7.5 s) or FT2 (3.75 s) slot of 12 kHz audio, the way
+// ft8_lib's demo/decode_ft8.c does (monitor -> candidates -> LDPC decode -> unpack, duplicates dropped), plus a signal
+// to noise estimate in WSJT-X's terms (dB in 2500 Hz) from the waterfall at the decoded message's own tones. Callsign
+// hashes (for <...> calls) are remembered between slots, as in the demo.
+// FT2 (WSJT-X Improved 3.1+, compatible with IU8LMC's) is FT4 at twice the speed: 288 samples a symbol, 41.7 Hz tones.
+// It is received as WSJT-X Improved does (lib/decoder.f90): each sample doubled, so the slot becomes an FT4 slot at half
+// the frequencies, decoded as FT4; frequencies are then doubled and times halved.
+#include "ft8_slot.h"                                // this file's function
+#include <math.h>                                    // log10f
+#include <pthread.h>                                 // the lock
+#include <stdio.h>                                   // snprintf
+#include <stdlib.h>                                  // malloc
+#include <string.h>                                  // memcmp, strcpy
+#include "ft8/decode.h"                              // candidates, decode
+#include "ft8/encode.h"                              // tones of a decoded message (for its SNR)
+#include "ft8/message.h"                             // unpacking
+#include "common/monitor.h"                          // audio -> waterfall
+
+#ifndef MAX_CANDIDATES
+#define MAX_CANDIDATES 140                           // candidates tried a slot (as the demo)
+#endif
+#ifndef MIN_SCORE
+#define MIN_SCORE 10                                 // sync score threshold (as the demo)
+#endif
+#ifndef LDPC_ITERATIONS
+#define LDPC_ITERATIONS 25                           // as the demo
+#endif
+#define MAX_DECODED 60                               // messages a slot
+#define HASH_SIZE 256                                // remembered callsigns
+
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER; // one decode at a time
+
+// ---- callsign hash table (ft8_lib demo/decode_ft8.c, unchanged in substance) ----
+static struct { char callsign[12]; uint32_t hash; } g_calls[HASH_SIZE]; // callsign, age (top 8 bits) + hash (22 bits)
+static int g_calls_n;                                // entries in use
+
+static void hash_cleanup(uint8_t max_age)            // forget calls not heard for max_age slots; age the rest
+{
+    for (int i = 0; i < HASH_SIZE; ++i) {
+        if (g_calls[i].callsign[0] == '\0') continue; // empty
+        uint8_t age = (uint8_t)(g_calls[i].hash >> 24); // its age
+        if (age > max_age) { g_calls[i].callsign[0] = '\0'; g_calls[i].hash = 0; g_calls_n--; } // too old: free it
+        else g_calls[i].hash = (((uint32_t)age + 1u) << 24) | (g_calls[i].hash & 0x3FFFFFu); // one slot older
+    }
+}
+
+static void hash_add(const char *callsign, uint32_t hash) // remember a callsign's hash
+{
+    uint16_t h10 = (hash >> 12) & 0x3FFu; int i = (h10 * 23) % HASH_SIZE; // starting slot
+    while (g_calls[i].callsign[0] != '\0') {
+        if (((g_calls[i].hash & 0x3FFFFFu) == hash) && strcmp(g_calls[i].callsign, callsign) == 0) { g_calls[i].hash &= 0x3FFFFFu; return; } // known: age 0 again
+        i = (i + 1) % HASH_SIZE;                     // clash: next slot
+    }
+    if (g_calls_n >= HASH_SIZE - 1) return;          // full (cannot happen with the cleanup, but never loop forever)
+    g_calls_n++; strncpy(g_calls[i].callsign, callsign, 11); g_calls[i].callsign[11] = '\0'; g_calls[i].hash = hash; // new
+}
+
+static bool hash_lookup(ftx_callsign_hash_type_t type, uint32_t hash, char *callsign) // a callsign from its hash
+{
+    uint8_t shift = (type == FTX_CALLSIGN_HASH_10_BITS) ? 12 : (type == FTX_CALLSIGN_HASH_12_BITS ? 10 : 0);
+    uint16_t h10 = (hash >> (12 - shift)) & 0x3FFu; int i = (h10 * 23) % HASH_SIZE;
+    for (int n = 0; n < HASH_SIZE && g_calls[i].callsign[0] != '\0'; n++) {
+        if (((g_calls[i].hash & 0x3FFFFFu) >> shift) == hash) { strcpy(callsign, g_calls[i].callsign); return true; } // found
+        i = (i + 1) % HASH_SIZE;
+    }
+    callsign[0] = '\0'; return false;                // unknown
+}
+
+static ftx_callsign_hash_interface_t g_hash_if = { .lookup_hash = hash_lookup, .save_hash = hash_add };
+
+// ---- SNR ----
+// Noise: the median waterfall level in the band around the signal (about 60 Hz either side of its 8 tones, the
+// signal's own bins left out, over the whole slot), turned into a mean power (an exponential distribution's median is
+// ln 2 of its mean). Taking it beside the signal, not over the whole band, follows the radio's passband and the band's
+// noise, as WSJT-X's baseline does. Signal: the mean power at the message's own tone in each of its symbols, less the
+// noise. Reported in 2500 Hz as WSJT-X does: SNR_OFFSET_DB converts from one bin's noise bandwidth (3.125 Hz bins of a
+// Hann window), checked against WSJT-X's reports on ft8_lib's test recordings (tools/test).
+#define SNR_OFFSET_DB 29.5f                          // 10 log10(2500 Hz / bin noise bandwidth) = 27.3, + 2.2 found against WSJT-X
+static float noise_near(const ftx_waterfall_t *wf, const ftx_candidate_t *c)
+{
+    int hist[256] = {0}; long total = 0;             // histogram of the 0.5 dB steps
+    int plane = (c->time_sub * wf->freq_osr + c->freq_sub) * wf->num_bins; // the candidate's sub-block / sub-bin plane
+    for (int b = 0; b < wf->num_blocks; b++) {
+        const WF_ELEM_T *row = wf->mag + (long)b * wf->block_stride + plane; // this block's bins
+        for (int k = c->freq_offset - 20; k < c->freq_offset + 28; k++) {
+            if (k < 0 || k >= wf->num_bins || (k >= c->freq_offset - 1 && k <= c->freq_offset + 8)) continue; // outside, or the signal
+            hist[row[k]]++; total++;
+        }
+    }
+    if (total == 0) return 0;                        // nothing beside it
+    long run = 0; int med = 0;
+    for (med = 0; med < 256; med++) { run += hist[med]; if (run >= total / 2) break; } // the median step
+    float db = med * 0.5f - 120.0f;                  // in dB
+    return powf(10.0f, db / 10.0f) / 0.693f;         // mean power
+}
+
+static float snr_db(const ftx_waterfall_t *wf, const ftx_candidate_t *c, const ftx_message_t *msg)
+{
+    float noise = noise_near(wf, c);                 // the noise beside it
+    uint8_t tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN]; int nn; // the message's tones
+    if (wf->protocol == FTX_PROTOCOL_FT4) { ft4_encode(msg->payload, tones); nn = FT4_NN; } else { ft8_encode(msg->payload, tones); nn = FT8_NN; }
+    int off = ((c->time_offset * wf->time_osr + c->time_sub) * wf->freq_osr + c->freq_sub) * wf->num_bins + c->freq_offset; // the candidate's first symbol (decode.c get_cand_mag)
+    double sum = 0; int n = 0;
+    for (int i = 0; i < nn; i++) {
+        if (wf->protocol == FTX_PROTOCOL_FT4 && (i == 0 || i == nn - 1)) continue; // FT4's ramp symbols
+        int block = c->time_offset + i; if (block < 0 || block >= wf->num_blocks) continue; // outside the slot
+        int bin = c->freq_offset + tones[i]; if (bin >= wf->num_bins) continue; // outside the band
+        float db = wf->mag[off + i * wf->block_stride + tones[i]] * 0.5f - 120.0f; // the tone's level
+        sum += powf(10.0f, db / 10.0f); n++;
+    }
+    if (n == 0 || noise <= 0) return -30.0f;         // nothing to go on
+    double s = sum / n - noise; if (s < noise * 0.001) s = noise * 0.001; // signal alone
+    float snr = 10.0f * log10f((float)(s / noise)) - SNR_OFFSET_DB; // in 2500 Hz
+    return snr < -30 ? -30 : (snr > 40 ? 40 : snr); // WSJT-X's range
+}
+
+
+// ---- the slot ----
+int ft8_decode_slot(const int16_t *samples, int n, int mode, char lines[][FT8_LINE], int max_lines)
+{
+    bool ft2 = mode == FTX_MODE_FT2;                 // FT2: decoded as FT4, stretched
+    int16_t *wide = NULL;                            // FT2: the slot with each sample doubled
+    if (ft2) {
+        wide = (int16_t *)malloc(sizeof(int16_t) * 2 * (size_t)n);
+        for (int i = 0; i < n; i++) wide[2 * i] = wide[2 * i + 1] = samples[i]; // twice as long: FT2 becomes FT4 at half the frequencies
+        samples = wide; n *= 2;
+    }
+    pthread_mutex_lock(&g_mx);
+    monitor_config_t cfg = { .f_min = ft2 ? 100 : 200, .f_max = ft2 ? 1500 : 3000, .sample_rate = 12000, .time_osr = 2, .freq_osr = 2,
+                             .protocol = mode == FTX_MODE_FT8 ? FTX_PROTOCOL_FT8 : FTX_PROTOCOL_FT4 }; // as the demo (FT2: its 200-3000 Hz, halved)
+    monitor_t mon; monitor_init(&mon, &cfg);         // the waterfall for the slot
+    float *frame = (float *)malloc(sizeof(float) * mon.block_size); // one block as floats
+    for (int pos = 0; pos + mon.block_size <= n; pos += mon.block_size) { // block by block
+        for (int i = 0; i < mon.block_size; i++) frame[i] = samples[pos + i] / 32768.0f;
+        monitor_process(&mon, frame);
+    }
+    free(frame);                                     // done with the audio
+    free(wide);                                      // (FT2's stretched copy)
+
+    const ftx_waterfall_t *wf = &mon.wf;
+    ftx_candidate_t cands[MAX_CANDIDATES];           // the likely signals
+    int ncand = ftx_find_candidates(wf, MAX_CANDIDATES, cands, MIN_SCORE);
+    static ftx_message_t decoded[MAX_DECODED]; ftx_message_t *table[MAX_DECODED] = {0}; // duplicates check (as the demo)
+    int nlines = 0;                                  // results
+    for (int k = 0; k < ncand && nlines < max_lines && nlines < MAX_DECODED; k++) {
+        const ftx_candidate_t *c = &cands[k];
+        ftx_message_t msg; ftx_decode_status_t st;
+        if (!ftx_decode_candidate(wf, c, LDPC_ITERATIONS, &msg, &st)) continue; // not a message
+        int h = msg.hash % MAX_DECODED; bool dup = false; // seen this slot already?
+        while (table[h] != NULL) { if (table[h]->hash == msg.hash && memcmp(table[h]->payload, msg.payload, sizeof(msg.payload)) == 0) { dup = true; break; } h = (h + 1) % MAX_DECODED; }
+        if (dup) continue;
+        decoded[h] = msg; table[h] = &decoded[h];    // remember it
+        char text[FTX_MAX_MESSAGE_LENGTH]; ftx_message_offsets_t offs;
+        if (ftx_message_decode(&msg, &g_hash_if, text, &offs) != FTX_MESSAGE_RC_OK) continue; // could not unpack
+        float freq = (mon.min_bin + c->freq_offset + (float)c->freq_sub / wf->freq_osr) / mon.symbol_period; // audio Hz
+        float t = (c->time_offset + (float)c->time_sub / wf->time_osr) * mon.symbol_period; // seconds from the slot start
+        float dt = t - 0.5f - mon.symbol_period;     // WSJT-X's DT: transmissions start 0.5 s into the slot; ft8_lib's times run one symbol late (0.16 s FT8: found against WSJT-X and with generated FT8 / FT4 signals)
+        float spacing = mode == FTX_MODE_FT8 ? 6.25f : mode == FTX_MODE_FT4 ? 12000.0f / 576 : 12000.0f / 288; // tone spacing in real Hz: 6.25, 20.8, 41.7
+        float snr = snr_db(wf, c, &msg) + 10.0f * log10f(spacing / 6.25f); // dB in 2500 Hz: SNR_OFFSET_DB is for FT8's bins; FT4's / FT2's are wider and hold that much more noise (equal signals now read alike in all three)
+        if (ft2) {                                   // back from the stretched slot
+            freq *= 2;                               // the real frequency
+            dt = (t - mon.symbol_period) / 2 - 0.15f; // the real start, from FT2's nominal 0.15 s (WSJT-X Improved's transmit delay)
+        }
+        snprintf(lines[nlines++], FT8_LINE, "%.0f\t%.1f\t%.0f\t%s", snr, dt, freq, text);
+    }
+    hash_cleanup(10);                                // age the remembered calls
+    monitor_free(&mon);
+    pthread_mutex_unlock(&g_mx);
+    return nlines;
+}
+
+// ---- transmit: ft8_lib's demo/gen_ft8.c (MIT) - message -> tones -> GFSK audio ----
+#define FT8_SYMBOL_BT 2.0f                           // symbol smoothing filter bandwidth factor (BT), as gen_ft8.c
+#define FT4_SYMBOL_BT 1.0f
+#define GFSK_CONST_K 5.336446f                       // == pi * sqrt(2 / log(2))
+
+static void gfsk_pulse(int n_spsym, float symbol_bt, float *pulse) // gen_ft8.c
+{
+    for (int i = 0; i < 3 * n_spsym; ++i) {
+        float t = i / (float)n_spsym - 1.5f;
+        float arg1 = GFSK_CONST_K * symbol_bt * (t + 0.5f);
+        float arg2 = GFSK_CONST_K * symbol_bt * (t - 0.5f);
+        pulse[i] = (erff(arg1) - erff(arg2)) / 2;
+    }
+}
+
+static void synth_gfsk(const uint8_t *symbols, int n_sym, float f0, float symbol_bt, float symbol_period, int signal_rate, float *signal) // gen_ft8.c
+{
+    int n_spsym = (int)(0.5f + signal_rate * symbol_period); // samples per symbol
+    int n_wave = n_sym * n_spsym;                    // output samples
+    float hmod = 1.0f;
+    float dphi_peak = 2 * M_PI * hmod / n_spsym;
+    float *dphi = (float *)malloc(sizeof(float) * (n_wave + 2 * n_spsym)); // (gen_ft8.c: on the stack)
+    for (int i = 0; i < n_wave + 2 * n_spsym; ++i) dphi[i] = 2 * M_PI * f0 / signal_rate; // shift up by f0
+    float *pulse = (float *)malloc(sizeof(float) * 3 * n_spsym);
+    gfsk_pulse(n_spsym, symbol_bt, pulse);
+    for (int i = 0; i < n_sym; ++i) {
+        int ib = i * n_spsym;
+        for (int j = 0; j < 3 * n_spsym; ++j) dphi[j + ib] += dphi_peak * symbols[i] * pulse[j];
+    }
+    for (int j = 0; j < 2 * n_spsym; ++j) {          // dummy symbols at the start and end, equal to the first and last
+        dphi[j] += dphi_peak * pulse[j + n_spsym] * symbols[0];
+        dphi[j + n_sym * n_spsym] += dphi_peak * pulse[j] * symbols[n_sym - 1];
+    }
+    float phi = 0;
+    for (int k = 0; k < n_wave; ++k) { signal[k] = sinf(phi); phi = fmodf(phi + dphi[k + n_spsym], 2 * M_PI); } // the waveform
+    int n_ramp = n_spsym / 8;                        // envelope shaping of the first and last symbols
+    for (int i = 0; i < n_ramp; ++i) {
+        float env = (1 - cosf(2 * M_PI * i / (2 * n_ramp))) / 2;
+        signal[i] *= env; signal[n_wave - 1 - i] *= env;
+    }
+    free(dphi); free(pulse);
+}
+
+int ft8_encode_audio(const char *text, int mode, float f0, int16_t *out, int max_samples, float amplitude)
+{
+    bool ft4 = mode != FTX_MODE_FT8;                 // FT4 and FT2 share FT4's tones
+    pthread_mutex_lock(&g_mx);
+    ftx_message_t msg;
+    ftx_message_rc_t rc = ftx_message_encode(&msg, &g_hash_if, text); // pack the text (the hash table learns <calls>)
+    pthread_mutex_unlock(&g_mx);
+    if (rc != FTX_MESSAGE_RC_OK) return -1;          // not a message FT8 / FT4 / FT2 can send
+    int num_tones = ft4 ? FT4_NN : FT8_NN;
+    uint8_t tones[FT4_NN > FT8_NN ? FT4_NN : FT8_NN];
+    if (ft4) ft4_encode(msg.payload, tones); else ft8_encode(msg.payload, tones);
+    float period = ft4 ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
+    if (mode == FTX_MODE_FT2) period /= 2;           // FT2: twice as fast (288 samples a symbol: WSJT-X Improved's gen_ft4wave, nsps 4*288 at 48 kHz)
+    int n = (int)(0.5f + num_tones * period * 12000); // samples of signal
+    if (n > max_samples) return -1;
+    float *sig = (float *)malloc(sizeof(float) * n);
+    synth_gfsk(tones, num_tones, f0, ft4 ? FT4_SYMBOL_BT : FT8_SYMBOL_BT, period, 12000, sig);
+    for (int i = 0; i < n; i++) out[i] = (int16_t)(sig[i] * amplitude * 32767.0f); // to 16-bit at the level asked
+    free(sig);
+    return n;
+}

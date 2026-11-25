@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ARCH-705</string>
+    <string name="accessibility_service_description">在桌面和其他应用上方显示 ARCH-705 可拖动悬浮 PTT。该服务只显示悬浮按钮，不读取其他应用的屏幕内容。</string>
+</resources>
