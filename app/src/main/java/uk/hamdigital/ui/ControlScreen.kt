@@ -43,6 +43,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import uk.hamdigital.MainViewModel
 import uk.hamdigital.RadioService
@@ -50,7 +52,6 @@ import uk.hamdigital.audio.AudioOut
 import uk.hamdigital.Screen
 import uk.hamdigital.core.AudioChoice
 import uk.hamdigital.core.BandPlan
-import uk.hamdigital.core.Mode
 import uk.hamdigital.core.TxControl
 import uk.hamdigital.rig.Ic705
 import uk.hamdigital.rig.Ic705Codec
@@ -92,21 +93,23 @@ fun ControlScreen(vm: MainViewModel) {
     val rig by Ic705.state.collectAsStateWithLifecycle()
     val wifiLogin by IcomNet.loginState.collectAsStateWithLifecycle()
     val rxChoice = if (wifiLogin) AudioChoice.WIFI else settings.audio
-    val rx = rememberRx(12000, 240, rxChoice) { b, n -> AudioOut.write12k(b, n) }
+    val rx = rememberRx(12000, 240, rxChoice, monitorWifi = false) { b, n -> AudioOut.write12k(b, n) }
+    val audioOwner = remember { Any() }
     val latency by IcomNet.latencyMs.collectAsStateWithLifecycle()
     var lossPercent by remember { mutableFloatStateOf(0f) }
-    var clock by remember { mutableStateOf(LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))) }
-    var utcClock by remember { mutableStateOf("") }
+    val clockFormat = remember { DateTimeFormatter.ofPattern("HH:mm") }
+    var utcClock by remember { mutableStateOf(LocalTime.now(ZoneOffset.UTC).format(clockFormat)) }
+    var bjcClock by remember { mutableStateOf(LocalTime.now(ZoneId.of("Asia/Shanghai")).format(clockFormat)) }
     LaunchedEffect(Unit) {
         while (true) {
-            clock = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
-            utcClock = LocalTime.now(java.time.ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("HH:mm"))
-            delay(30_000)
+            utcClock = LocalTime.now(ZoneOffset.UTC).format(clockFormat)
+            bjcClock = LocalTime.now(ZoneId.of("Asia/Shanghai")).format(clockFormat)
+            delay(1000)
         }
     }
     DisposableEffect(Unit) {
-        AudioOut.open()
-        onDispose { AudioOut.close() }
+        AudioOut.open(audioOwner)
+        onDispose { AudioOut.close(audioOwner) }
     }
     LaunchedEffect(rig.link) {
         while (rig.link == RigState.Link.CONNECTED) {
@@ -122,20 +125,21 @@ fun ControlScreen(vm: MainViewModel) {
     var spectrumPreviewHz by remember { mutableStateOf<Long?>(null) }
     var spectrumLocked by rememberSaveable { mutableStateOf(false) }
     var levelsLocked by rememberSaveable { mutableStateOf(true) }
-    var frequencyEntryVfo by remember { mutableStateOf<Int?>(null) }
-    var frequencyEntryText by remember { mutableStateOf("") }
+    var frequencyEntryVfo by rememberSaveable { mutableStateOf<Int?>(null) }
+    var frequencyEntryText by rememberSaveable { mutableStateOf("") }
     var frequencyEntryMode by remember { mutableStateOf<MainModeChoice?>(null) }
-    var frequencyEntryError by remember { mutableStateOf("") }
+    var frequencyEntryError by rememberSaveable { mutableStateOf("") }
+    var channelsShown by rememberSaveable { mutableIntStateOf(40) }
     val modeA = rig.modeA.ifBlank { if (rig.selectedVfo == 0) rig.modeText else "" }
     val modeB = rig.modeB.ifBlank { if (rig.selectedVfo == 1) rig.modeText else "" }
-    var modeMenuVfo by remember { mutableStateOf<Int?>(null) }
-    var stepDialog by remember { mutableStateOf(false) }
-    var exitAsk by remember { mutableStateOf(false) }
-    var toneDialog by remember { mutableStateOf(false) }
-    var duplexDialog by remember { mutableStateOf(false) }
-    var saveChannelDialog by remember { mutableStateOf(false) }
-    var powerOffAsk by remember { mutableStateOf(false) }
-    var channelName by remember { mutableStateOf("") }
+    var modeMenuVfo by rememberSaveable { mutableStateOf<Int?>(null) }
+    var stepDialog by rememberSaveable { mutableStateOf(false) }
+    var exitAsk by rememberSaveable { mutableStateOf(false) }
+    var toneDialog by rememberSaveable { mutableStateOf(false) }
+    var duplexDialog by rememberSaveable { mutableStateOf(false) }
+    var saveChannelDialog by rememberSaveable { mutableStateOf(false) }
+    var powerOffAsk by rememberSaveable { mutableStateOf(false) }
+    var channelName by rememberSaveable { mutableStateOf("") }
     var meterMode by rememberSaveable { mutableIntStateOf(0) }
     val connected = rig.link == RigState.Link.CONNECTED
     val transmitting = rig.tx || rig.txRequested
@@ -149,6 +153,8 @@ fun ControlScreen(vm: MainViewModel) {
 
     fun finishRemoteApp() {
         uk.hamdigital.ArchFloatingPttService.disableFromExit(ctx)
+        uk.hamdigital.core.PttLock.lock()
+        uk.hamdigital.audio.VoiceTx.stop()
         TxControl.stopAll()
         IcomNet.forceUnkey()
         IcomNet.disconnect {
@@ -167,7 +173,7 @@ fun ControlScreen(vm: MainViewModel) {
         Ic705.setFrequency(next)
     }
     LaunchedEffect(transmitting) { if (transmitting) modeMenuVfo = null }
-    LaunchedEffect(spectrumLocked) { if (spectrumLocked) spectrumPreviewHz = null }
+    LaunchedEffect(rig.selectedVfo, rig.link, spectrumLocked) { spectrumPreviewHz = null }
 
     fun selectVfo(vfo: Int) { if (controlsEnabled && rig.selectedVfo != vfo) if (vfo == 0) Ic705.selectVfoA() else Ic705.selectVfoB() }
     fun applyMainMode(vfo: Int, choice: MainModeChoice) {
@@ -361,7 +367,6 @@ fun ControlScreen(vm: MainViewModel) {
                 Icon(Icons.Filled.PowerSettingsNew, if (connected) "软关机" else "软开机", tint = powerColor, modifier = Modifier.size(20.dp))
             }
         }
-        ArchNavAction("功能") { vm.show(Screen.Functions) }
         ArchNavAction("设置") { vm.show(Screen.SettingsPage) }
         ArchPressable(onClick = { exitAsk = true }, modifier = Modifier.size(38.dp), contentAlignment = Alignment.Center) {
             Box(Modifier.size(38.dp).clip(CircleShape).background(Pal.Red.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
@@ -384,19 +389,10 @@ fun ControlScreen(vm: MainViewModel) {
                             maxLines = 1,
                             modifier = Modifier.weight(1f),
                         )
-                        uk.hamdigital.ui.Text("UTC $utcClock  BJT $clock", color = Pal.Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
-                    }
-                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        val chip = { normal: Color -> if (transmitting) Pal.Red else normal }
-                        StatusChip(if (transmitting) "TX" else if (connected) "RX" else "OFF", if (transmitting) Pal.Red else if (connected) Pal.Green else Pal.Amber)
-                        StatusChip(rig.modeText.ifBlank { "—" }, chip(Pal.Cyan))
-                        if (rig.filter >= 1) StatusChip("FIL${rig.filter}", chip(Pal.Amber))
-                        if (rig.preamp > 0) StatusChip("PRE${rig.preamp}", chip(Pal.Text2))
-                        if (rig.att == 20) StatusChip("ATT20", chip(Pal.Amber))
-                        if (rig.agc >= 1) StatusChip("AGC${when (rig.agc) { 1 -> "快"; 2 -> "中"; 3 -> "慢"; else -> "—" }}", chip(Pal.Text2))
-                        if (rig.nb == 1) StatusChip("NB", chip(Pal.Text2))
-                        if (rig.nr > 0 && rig.nrLevel > 0) StatusChip("NR${nrValue(rig.nrLevel)}", chip(Pal.Text2))
-                        if (rig.autoNotch == 1) StatusChip("AN", chip(Pal.Text2))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            uk.hamdigital.ui.Text("UTC $utcClock", color = Pal.Amber, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
+                            uk.hamdigital.ui.Text("BJC $bjcClock", color = Pal.Red, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
+                        }
                     }
                     Row(Modifier.fillMaxWidth().padding(top = 5.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         VfoFrequencyCell(
@@ -464,28 +460,51 @@ fun ControlScreen(vm: MainViewModel) {
                 }
             }
 
-            ArchCard(Modifier.fillMaxWidth(), contentPadding = PaddingValues(8.dp)) {
-                InlinePttButton(vm, height = 120.dp)
-            }
-
             ChoiceGrid(BandPlan.presets.map { preset ->
                 ControlChoice(preset.label, BandPlan.labelFor(rig.freqHz) == preset.label) { chooseBand(preset) }
             }, columns = 5, enabled = controlsEnabled)
 
+            ArchCard(Modifier.fillMaxWidth(), contentPadding = PaddingValues(8.dp)) {
+                InlinePttButton(vm, height = 120.dp)
+            }
+
+
+            val channels = remember(settings.savedChannels) { parseChannels(settings.savedChannels) }
+            val visibleChannels = channels.take(channelsShown)
+            ArchCard(Modifier.fillMaxWidth(), contentPadding = PaddingValues(8.dp)) {
+                Column {
+                    ArchPressable(onClick = { channelName = ""; saveChannelDialog = true }, enabled = controlsEnabled, modifier = Modifier.fillMaxWidth().height(38.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.fillMaxSize().clip(ArchControlShape).background(Pal.Accent.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
+                            uk.hamdigital.ui.Text("信道存储", color = Pal.Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    if (visibleChannels.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        ChoiceGrid(visibleChannels.map { ch -> ControlChoice(ch.name) {
+                            Ic705.setFrequency(ch.hz)
+                            Ic705.setChannelMode(ch.modeCode, ch.data)
+                            Ic705.applyChannelConfiguration(ch.toneMode, ch.toneTenths, ch.tsqlTenths, ch.dtcsCode, ch.split, ch.offsetHz)
+                        } }, enabled = controlsEnabled)
+                    }
+                    if (visibleChannels.size < channels.size) {
+                        TextButton({ channelsShown += 40 }, enabled = controlsEnabled) { uk.hamdigital.ui.Text("显示更多频道", color = Pal.Cyan, fontSize = 11.sp) }
+                    }
+                }
+            }
 
             ArchCard(Modifier.fillMaxWidth(), contentPadding = PaddingValues(8.dp)) {
                 Column {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         RotaryKnob("RF 增益", if (rig.rfGain >= 0) percentValue(rig.rfGain) else 0, 0..100,
-                            if (rig.rfGain >= 0) percentValue(rig.rfGain).toString() else "—", { Ic705.setRfGain(rawFromPercent(it)) }, controlsEnabled, Modifier.weight(1f))
+                            if (rig.rfGain >= 0) percentValue(rig.rfGain).toString() else "—", { Ic705.setRfGain(rawFromPercent(it)) }, controlsEnabled && !levelsLocked, Modifier.weight(1f))
                         RotaryKnob("静噪 SQL", if (rig.sql >= 0) percentValue(rig.sql) else 0, 0..100,
-                            if (rig.sql >= 0) percentValue(rig.sql).toString() else "—", { Ic705.setSquelch(rawFromPercent(it)) }, controlsEnabled, Modifier.weight(1f))
+                            if (rig.sql >= 0) percentValue(rig.sql).toString() else "—", { Ic705.setSquelch(rawFromPercent(it)) }, controlsEnabled && !levelsLocked, Modifier.weight(1f))
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         RotaryKnob("发射功率", if (rig.power >= 0) percentValue(rig.power) else 0, 0..100,
-                            if (rig.power >= 0) percentValue(rig.power).toString() else "—", { Ic705.setPower(rawFromPercent(it)) }, controlsEnabled, Modifier.weight(1f))
+                            if (rig.power >= 0) percentValue(rig.power).toString() else "—", { Ic705.setPower(rawFromPercent(it)) }, controlsEnabled && !levelsLocked, Modifier.weight(1f))
                         RotaryKnob("NR 降噪", if (rig.nrLevel >= 0) nrValue(rig.nrLevel) else 0, 0..9,
-                            if (rig.nr > 0 && rig.nrLevel > 0) nrValue(rig.nrLevel).toString() else "0", { Ic705.setNrLevel(rawFromNr(it)) }, controlsEnabled, Modifier.weight(1f))
+                            if (rig.nr > 0 && rig.nrLevel > 0) nrValue(rig.nrLevel).toString() else "0", { Ic705.setNrLevel(rawFromNr(it)) }, controlsEnabled && !levelsLocked, Modifier.weight(1f))
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                         TextButton({ Ic705.restoreBaselineLevels() }, enabled = controlsEnabled, modifier = Modifier.weight(1.1f)) { uk.hamdigital.ui.Text("恢复连接时数值", fontSize = 10.sp, maxLines = 1) }
@@ -499,24 +518,6 @@ fun ControlScreen(vm: MainViewModel) {
                 }
             }
 
-            val channels = parseChannels(settings.savedChannels)
-            ArchCard(Modifier.fillMaxWidth(), contentPadding = PaddingValues(8.dp)) {
-                Column {
-                    ArchPressable(onClick = { channelName = ""; saveChannelDialog = true }, enabled = controlsEnabled, modifier = Modifier.fillMaxWidth().height(38.dp), contentAlignment = Alignment.Center) {
-                        Box(Modifier.fillMaxSize().clip(ArchControlShape).background(Pal.Accent.copy(alpha = 0.16f)), contentAlignment = Alignment.Center) {
-                            uk.hamdigital.ui.Text("＋  保存当前频率、模式和哑音/频差  ·  ${channels.size}", color = Pal.Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                    if (channels.isNotEmpty()) {
-                        Spacer(Modifier.height(6.dp))
-                        ChoiceGrid(channels.map { ch -> ControlChoice(ch.name) {
-                            Ic705.setFrequency(ch.hz)
-                            Ic705.setChannelMode(ch.modeCode, ch.data)
-                            Ic705.applyChannelConfiguration(ch.toneMode, ch.toneTenths, ch.tsqlTenths, ch.dtcsCode, ch.split, ch.offsetHz)
-                        } }, enabled = controlsEnabled)
-                    }
-                }
-            }
         }
     }
 }
@@ -630,18 +631,20 @@ internal fun FrequencyEntryDialog(
     selectedMode: MainModeChoice?,
     error: String,
     enabled: Boolean,
+    showModes: Boolean = true,
     onKey: (String) -> Unit,
     onMode: (MainModeChoice) -> Unit,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val visibleModes = MAIN_MODES
     val enteredHz = value.toDoubleOrNull()?.times(1_000_000.0)?.toLong()
     val valid = enteredHz != null && enteredHz in 30_000L..1_300_000_000L
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                uk.hamdigital.ui.Text(if (vfo == 0) "VFO A 频率与模式" else "VFO B 频率与模式", modifier = Modifier.weight(1f))
+                uk.hamdigital.ui.Text(if (!showModes) (if (vfo == 0) "VFO A 频率" else "VFO B 频率") else (if (vfo == 0) "VFO A 频率与模式" else "VFO B 频率与模式"), modifier = Modifier.weight(1f))
                 IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, "关闭", tint = Pal.Text2) }
             }
         },
@@ -662,7 +665,7 @@ internal fun FrequencyEntryDialog(
                     uk.hamdigital.ui.Text("MHz", color = Pal.Muted, fontSize = 9.sp, modifier = Modifier.align(Alignment.BottomEnd).padding(7.dp))
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Column(Modifier.weight(1.12f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Column(Modifier.weight(if (showModes) 1.12f else 1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         listOf(listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9"), listOf(".", "0", "⌫")).forEach { row ->
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 row.forEach { key ->
@@ -692,18 +695,18 @@ internal fun FrequencyEntryDialog(
                             ) { uk.hamdigital.ui.Text("清空", color = Pal.Amber, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
                         }
                     }
-                    Column(Modifier.weight(0.88f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        MAIN_MODES.chunked(2).forEach { pair ->
+                    if (showModes) Column(Modifier.weight(0.88f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        visibleModes.chunked(3).forEach { pair ->
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                 pair.forEach { choice ->
                                     val selected = selectedMode?.label == choice.label || (selectedMode == null && currentMode == choice.label)
-                                    ArchPressable(onClick = { onMode(choice) }, modifier = Modifier.weight(1f).height(36.dp), contentAlignment = Alignment.Center) {
+                                    ArchPressable(onClick = { onMode(choice) }, modifier = Modifier.weight(1f).height(44.dp), contentAlignment = Alignment.Center) {
                                         Box(
                                             Modifier.fillMaxSize().clip(RoundedCornerShape(4.dp))
                                                 .background(if (selected) Pal.IcomBlue else Pal.Surface2)
                                                 .border(1.dp, if (selected) Color.White.copy(alpha = 0.35f) else Pal.Border, RoundedCornerShape(4.dp)),
                                             contentAlignment = Alignment.Center,
-                                        ) { uk.hamdigital.ui.Text(choice.label, color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+                                        ) { uk.hamdigital.ui.Text(choice.label, color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
                                     }
                                 }
                                 if (pair.size == 1) Spacer(Modifier.weight(1f))
@@ -773,17 +776,6 @@ private fun VfoFrequencyCell(
                 contentAlignment = Alignment.Center,
             ) { uk.hamdigital.ui.Text(mode.ifBlank { "—" }, color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
         }
-    }
-}
-
-@Composable
-private fun StatusChip(label: String, color: Color) {
-    Surface(
-        shape = RoundedCornerShape(3.dp),
-        color = Pal.IcomBlue,
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.22f)),
-    ) {
-        uk.hamdigital.ui.Text(label, color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp), maxLines = 1)
     }
 }
 
@@ -876,10 +868,8 @@ private fun MeterPanel(rig: RigState, mode: Int, modifier: Modifier = Modifier) 
                         )
                     }
                 }
-                uk.hamdigital.ui.Text("SQL ${if (rig.sql >= 0) percentValue(rig.sql) else "—"}", color = Pal.Text2, fontSize = 7.sp, modifier = Modifier.padding(start = 6.dp))
             } else {
                 uk.hamdigital.ui.Text(meterScale(mode), color = Pal.Muted, fontSize = 7.sp, modifier = Modifier.weight(1f))
-                uk.hamdigital.ui.Text("SQL ${if (rig.sql >= 0) percentValue(rig.sql) else "—"}", color = Pal.Text2, fontSize = 7.sp)
             }
         }
     }
@@ -1224,9 +1214,9 @@ private fun KnobButton(text: String, enabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-private fun scopeSpanLabel(index: Int): String = listOf("±2.5k", "±5k", "±10k", "±25k", "±50k", "±100k", "±250k", "±500k").getOrNull(index) ?: "—"
+internal fun scopeSpanLabel(index: Int): String = listOf("±2.5k", "±5k", "±10k", "±25k", "±50k", "±100k", "±250k", "±500k").getOrNull(index) ?: "—"
 
-private fun nextScopeSpan(index: Int): Int = (index.coerceAtLeast(0) + 1) % 8
+internal fun nextScopeSpan(index: Int): Int = (index.coerceAtLeast(0) + 1) % 8
 private fun percentValue(raw: Int): Int = Ic705Codec.levelPercent(raw)
 private fun rawFromPercent(value: Int): Int = Ic705Codec.rawFromPercent(value)
 private fun nrValue(raw: Int): Int = Ic705Codec.nrDisplay(raw)
@@ -1279,21 +1269,3 @@ private fun filterText(hz: Int): String = when {
     else -> "%.1f k".format(hz / 1000.0)
 }
 
-private fun shortModeName(mode: Mode): String = when (mode) {
-    Mode.FT8 -> "FT8"
-    Mode.FT4 -> "FT4"
-    Mode.FT2 -> "FT2"
-    Mode.WSPR -> "WSPR"
-    Mode.JS8 -> "JS8"
-    Mode.RTTY -> "RTTY"
-    Mode.JTTY -> "JTTY"
-    Mode.PSK31 -> "PSK"
-    Mode.OLIVIA -> "Olivia"
-    Mode.CW -> "CW"
-    Mode.SSTV -> "SSTV"
-    Mode.DSTAR -> "DV"
-    Mode.FREEDV -> "FreeDV"
-    Mode.WEFAX -> "FAX"
-    Mode.APRS -> "APRS"
-    Mode.FREEDATA -> "DATA"
-}

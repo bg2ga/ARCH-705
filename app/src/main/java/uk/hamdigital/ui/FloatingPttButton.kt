@@ -14,7 +14,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -29,6 +28,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -88,25 +88,31 @@ private fun VoicePttButton(
         if (!granted) error = "需要麦克风权限"
     }
 
-    fun stop() {
-        if (!VoiceTx.active.value) return
+    fun releasePress(pressSession: Long) {
+        if (pressSession <= 0L) return
+        VoiceTx.release(pressSession)
+        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    fun stopNow() {
         VoiceTx.stop()
         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
     }
 
-    fun start() {
+    fun start(): Boolean {
         error = ""
-        if (locked) { error = "PTT 已锁定，请先点右上角解锁"; return }
-        if (rig.link != RigState.Link.CONNECTED) { error = "电台未连接"; return }
+        if (locked) { error = "PTT 已锁定，请先点右上角解锁"; return false }
+        if (rig.link != RigState.Link.CONNECTED) { error = "电台未连接"; return false }
         if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             permission.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            return false
         }
         if (!VoiceTx.start(ctx, settings)) {
             error = VoiceTx.lastError.value.ifBlank { "PTT 启动失败" }
-            return
+            return false
         }
         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+        return true
     }
 
     val buttonScale by animateFloatAsState(if (active && txOn) 0.975f else 1f, spring(dampingRatio = 0.68f, stiffness = Spring.StiffnessMediumLow), label = "ptt-scale")
@@ -116,7 +122,7 @@ private fun VoicePttButton(
         label = "ptt-color",
     )
     LaunchedEffect(txOn) {
-        if (active && !txOn) {
+        if (!txOn && VoiceTx.active.value) {
             VoiceTx.stop()
             error = "发射已由安全机制停止"
         }
@@ -151,10 +157,26 @@ private fun VoicePttButton(
                     .border(1.dp, if (active && txOn) Color.White.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.12f), RoundedCornerShape(if (compact) 16.dp else 18.dp))
                     .then(if (!locked) Modifier.pointerInput(settings.txOk, gate) {
                         awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false)
-                            if (settings.txOk) start() else gate.ask { error = "已接受发射许可，请再次按住 PTT" }
-                            waitForUpOrCancellation()
-                            if (active) stop()
+                            val down = awaitFirstDown(requireUnconsumed = true)
+                            val pressSession = beginMomentaryPtt(
+                                start = {
+                                    if (settings.txOk) start()
+                                    else {
+                                        gate.ask { error = "已接受发射许可，请再次按住 PTT" }
+                                        false
+                                    }
+                                },
+                                currentSession = VoiceTx::currentSession,
+                            )
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Main)
+                                    val tracked = event.changes.firstOrNull { it.id == down.id }
+                                    if (tracked == null || !tracked.pressed) break
+                                }
+                            } finally {
+                                releasePress(pressSession)
+                            }
                         }
                     } else Modifier),
                 contentAlignment = Alignment.Center,
@@ -172,7 +194,7 @@ private fun VoicePttButton(
                     .background(if (locked) Pal.Amber.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.10f))
                     .border(1.dp, if (locked) Pal.Amber.copy(alpha = 0.65f) else Color.White.copy(alpha = 0.16f), RoundedCornerShape(8.dp))
                     .clickable {
-                        if (active) stop()
+                        if (active) stopNow()
                         PttLock.toggle()
                         error = if (PttLock.locked.value) "PTT 已锁定" else "PTT 已解锁"
                     },

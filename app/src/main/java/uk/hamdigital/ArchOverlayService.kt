@@ -70,26 +70,47 @@ class ArchOverlayService : Service() {
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "悬浮 PTT", NotificationManager.IMPORTANCE_LOW).apply {
             description = "ARCH-705 系统悬浮 PTT"
         })
+        if (!startForegroundCompat()) return
+        collect()
+    }
+
+    private fun buildNotification(): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE)
-        val notification: Notification = Notification.Builder(this, CHANNEL)
+        return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_launcher_fg)
             .setContentTitle("ARCH-705 · 悬浮 PTT")
             .setContentText("系统悬浮 PTT 已开启")
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        try {
-            if (Build.VERSION.SDK_INT >= 29) startForeground(ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-            else startForeground(ID, notification)
-        } catch (_: Exception) {
-            stopSelf()
-            return
-        }
-        collect()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+    private fun startForegroundCompat(): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            if (Build.VERSION.SDK_INT >= 30 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            startForeground(ID, buildNotification(), type)
+        } else startForeground(ID, buildNotification())
+        true
+    } catch (_: Exception) {
+        stopSelf()
+        false
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!startForegroundCompat()) return START_NOT_STICKY
+        sync()
+        return START_NOT_STICKY
+    }
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        hideOverlay()
+        emergencyStop()
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
+    }
 
     private fun collect() {
         if (collectJob != null) return
@@ -151,7 +172,12 @@ class ArchOverlayService : Service() {
         view.setLocked(PttLock.locked.value)
         view.setActive(Transmitter.on.value)
         view.setConnected(Ic705.state.value.link == RigState.Link.CONNECTED)
-        runCatching { wm.addView(view, lp) }
+        val added = runCatching { wm.addView(view, lp) }
+        if (added.isFailure) {
+            toast("悬浮 PTT 无法显示，请检查“显示在其他应用上层”权限")
+            stopSelf()
+            return
+        }
         overlay = view
     }
 

@@ -27,6 +27,10 @@ class Ic705CodecTest {
         assertEquals(31, Ic705Codec.filterLimit("RTTY"))
     }
 
+    @Test fun repeaterOffsetUsesTenHertzUnits() {
+        assertEquals(5_000_000L, Ic705Codec.offsetValue(Ic705Codec.frequencyBcd(500_000L).toList()))
+    }
+
     @Test fun frequencyBcdRoundTripsEveryScopeSpan() {
         listOf(2_500L, 5_000L, 10_000L, 25_000L, 50_000L, 100_000L, 250_000L, 500_000L,
             14_074_000L, 14_200_000L, 145_500_000L, 438_500_000L).forEach { hz ->

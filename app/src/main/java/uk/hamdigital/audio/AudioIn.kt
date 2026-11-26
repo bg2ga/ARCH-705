@@ -13,6 +13,7 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.flow.MutableStateFlow
 import uk.hamdigital.core.AudioChoice
 import kotlin.math.abs
 
@@ -36,6 +37,7 @@ object AudioIn {
     @Volatile private var activeRecord: AudioRecord? = null
     private var activeStop = AtomicBoolean(false)
     @Volatile var owner: Any? = null; private set     // the page that started it (only it stops it)
+    val captureError = MutableStateFlow<String?>(null)
 
     fun allowed(ctx: Context) = ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
@@ -59,9 +61,10 @@ object AudioIn {
         if (useWifi) {             // the radio's audio over WiFi (IcomNet): no recording here
             lastCapture = null
             backgroundPaused = false
+            captureError.value = null
             synchronized(netLock) {
                 generation++
-                netSink = sink; netBlock = ShortArray(block); netFill = 0; netPos = 0.0; netStep = 12000.0 / sampleRate
+                netSink = sink; netBlock = ShortArray(block); netFill = 0; netPos = 0.0; netStep = 48000.0 / sampleRate
                 netLast = 0
             }
             sourceName = "IC-705 (WiFi)"; rate = sampleRate; owner = who; running = true; wifi = true
@@ -84,6 +87,7 @@ object AudioIn {
         rate = sampleRate; owner = who; running = true
         lastCapture = CaptureRequest(ctx.applicationContext, who, choice, sampleRate, block, sink)
         backgroundPaused = false
+        captureError.value = null
         val stopFlag = AtomicBoolean(true)
         activeStop = stopFlag
         activeRecord = rec
@@ -93,7 +97,10 @@ object AudioIn {
             try {
                 while (stopFlag.get() && generation == myGeneration) {
                     val n = rec.read(buf, 0, buf.size)
-                    if (n < 0) break
+                    if (n < 0) {
+                        captureError.value = "音频输入读取失败（$n）"
+                        break
+                    }
                     if (n == 0 || !stopFlag.get() || generation != myGeneration) continue
                     var peak = 0
                     for (i in 0 until n) { val v = abs(buf[i].toInt()); if (v > peak) peak = v }
@@ -101,18 +108,23 @@ object AudioIn {
                     if (generation == myGeneration) level = if (l > level) l else level * 0.95f
                     synchronized(netLock) { if (stopFlag.get() && generation == myGeneration) sink(buf, n) }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (generation == myGeneration) captureError.value = "音频输入异常：${e.message ?: "未知错误"}"
             } finally {
                 stopFlag.set(false)
                 runCatching { rec.stop() }
                 runCatching { rec.release() }
-                if (generation == myGeneration) level = 0f
+                if (generation == myGeneration) {
+                    level = 0f
+                    running = false
+                }
             }
         }, "audio-in").apply { priority = Thread.MAX_PRIORITY; start() }
         return null
     }
 
     /** Stop, if [who] started it (a page closing must not stop the next page's capture). */
+    @Synchronized
     fun stop(who: Any) {
         if (owner === who || lastCapture?.who === who) {
             lastCapture = null
@@ -151,7 +163,7 @@ object AudioIn {
         runCatching { rec?.stop() }
         runCatching { rec?.release() }
         val old = thread
-        old?.join(3000)
+        old?.join(200)
         if (old?.isAlive == true) {
             thread = old
             return false
@@ -162,7 +174,7 @@ object AudioIn {
         return true
     }
 
-    // ---- WiFi audio (IcomNet hands it in on its network thread): 12 kHz, converted to the page's rate ----
+    // ---- WiFi audio (IcomNet hands it in on its network thread): 48 kHz, converted to the page's rate ----
     @Volatile private var netSink: ((ShortArray, Int) -> Unit)? = null // the page's decoder and waterfall
     private val netLock = Any()
     @Volatile private var generation = 0L
@@ -172,8 +184,9 @@ object AudioIn {
 
     /** Receive audio from the radio over WiFi. */
     fun netAudio(s: ShortArray, n: Int) {
+        val sink = netSink ?: return
+        val completed = ArrayList<ShortArray>(2)
         synchronized(netLock) {
-            val sink = netSink ?: return
             if (!running || generation == 0L || n == 0 || netBlock.isEmpty()) return
             var peak = 0
             for (i in 0 until n) { val v = abs(s[i].toInt()); if (v > peak) peak = v }
@@ -182,18 +195,18 @@ object AudioIn {
             while (netPos < n) {
                 val i = netPos.toInt()
                 val f = netPos - i
-                val a = if (i == 0) netLast.toInt() else s[i - 1].toInt()
+                val a = if (i == 0) { if (f > 0.0) netLast.toInt() else s[0].toInt() } else s[i - 1].toInt()
                 val b = s[i].toInt()
                 netBlock[netFill++] = (a + (b - a) * f).toInt().toShort()
                 if (netFill == netBlock.size) {
-                    val completed = netBlock.copyOf()
+                    completed.add(netBlock.copyOf())
                     netFill = 0
-                    sink(completed, completed.size)
                 }
                 netPos += netStep
             }
             netPos -= n
             netLast = s[n - 1]
         }
+        completed.forEach { block -> runCatching { sink(block, block.size) } }
     }
 }

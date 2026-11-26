@@ -25,7 +25,8 @@ class RadioService : Service() {
 
         /** Start (or keep) the service - call while the app is on screen (Android allows starting it only then). */
         fun start(ctx: Context) {
-            try { ctx.startForegroundService(Intent(ctx, RadioService::class.java)) } catch (e: Exception) { } // (refused if the app is not in front: it will be next time)
+            try { ctx.startForegroundService(Intent(ctx, RadioService::class.java)) }
+            catch (e: Exception) { android.util.Log.w("ARCH705", "RadioService start failed", e) }
         }
 
         fun stop(ctx: Context) { ctx.stopService(Intent(ctx, RadioService::class.java)) }
@@ -36,6 +37,7 @@ class RadioService : Service() {
     /** The app swiped away from the recent apps: log out of the radio (while this service still keeps the network), then stop. */
     override fun onTaskRemoved(rootIntent: Intent?) {
         ArchFloatingPttService.disableFromExit(this)
+        uk.hamdigital.core.PttLock.lock()
         uk.hamdigital.audio.VoiceTx.stop()
         uk.hamdigital.core.TxControl.stopAll()           // nothing goes on sending (0.10.4)
         uk.hamdigital.rig.IcomNet.disconnect { stopSelf() }
@@ -52,10 +54,24 @@ class RadioService : Service() {
             .setContentText("正在保持 IC-705 连接和接收音频").setContentIntent(open).setOngoing(true).build()
         var type = 0                                  // what the service does in the background (Android 14 asks)
         if (Build.VERSION.SDK_INT >= 29) {
-            type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE // the radio over WiFi / USB
-            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE // receive audio (USB sound card / microphone)
+            type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            if (Build.VERSION.SDK_INT >= 30 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         }
-        try { if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, type) else startForeground(ID, n) } catch (e: Exception) { stopSelf() } // (refused: carry on without it)
-        return START_STICKY                         // keep the link alive after the screen is turned off
+        try { if (Build.VERSION.SDK_INT >= 29) startForeground(ID, n, type) else startForeground(ID, n) }
+        catch (e: Exception) { android.util.Log.w("ARCH705", "RadioService foreground start failed", e); stopSelf() }
+        if (intent == null && !uk.hamdigital.rig.IcomNet.hasActiveTarget()) {
+            Thread({
+                val profile = uk.hamdigital.core.RadioProfiles.active(this)
+                if (profile == null || profile.address.isBlank() || profile.user.isBlank() || profile.password.isBlank()) stopSelf()
+                else uk.hamdigital.rig.IcomNet.connect(
+                    this, profile.address, profile.controlPort, profile.user, profile.password,
+                    if (profile.useDefaultPorts) -1 else profile.serialPort,
+                    if (profile.useDefaultPorts) -1 else profile.audioPort,
+                    powerOn = true,
+                )
+            }, "radio-profile-resume").start()
+        }
+        return START_STICKY
     }
 }

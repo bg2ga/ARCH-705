@@ -8,6 +8,8 @@ package uk.hamdigital.icom;
 
 import android.util.Log;
 
+import android.net.Network;
+
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -30,6 +32,8 @@ public class IcomUdpClient {
     //private int remotePort;
     private int localPort = -1;
     private volatile String expectedRemoteIp;
+    private volatile int expectedRemotePort = -1;
+    private final Network preferredNetwork;
     private boolean activated = false;
     private OnUdpEvents onUdpEvents = null;
     private final ExecutorService doReceiveThreadPool = Executors.newCachedThreadPool(r -> {
@@ -46,12 +50,17 @@ public class IcomUdpClient {
     });
     private volatile boolean closed = false;
 
-    public IcomUdpClient() {//本地端口随机
-        localPort = -1;
+    public IcomUdpClient() {
+        this(-1, null);
     }
 
-    public IcomUdpClient(int localPort) {//如果localPort==-1，本地端口随机
+    public IcomUdpClient(int localPort) {
+        this(localPort, null);
+    }
+
+    public IcomUdpClient(int localPort, Network preferredNetwork) {
         this.localPort = localPort;
+        this.preferredNetwork = preferredNetwork;
     }
 
     public void sendData(byte[] data, String ip, int port) throws UnknownHostException {
@@ -59,6 +68,7 @@ public class IcomUdpClient {
 
         InetAddress address = InetAddress.getByName(ip);
         expectedRemoteIp = address.getHostAddress();
+        expectedRemotePort = port;
         // HF Digital Modes: each packet its own copy and its own task. FT8CN reused one shared SendDataRunnable and
         // overwrote its data before the pool had sent it, so packets close together could be lost or sent twice.
         SendDataRunnable r = new SendDataRunnable(this);
@@ -124,22 +134,28 @@ public class IcomUdpClient {
 
     public synchronized void setActivated(boolean activated) throws SocketException {
         if (activated && closed) throw new SocketException("IcomUdpClient is closed");
-        if (activated) this.activated = true;         // HF Digital Modes: (off only after the send queue has drained, below)
-        if (activated) {//通过activated判断是否结束接收线程，并清空sendSocket指针
-            sendSocket = new DatagramSocket();
-            //new DatagramSocket(null);//绑定的端口号随机
-            sendSocket.setReuseAddress(true);
-            if (localPort != -1) {//绑定指定的本机端口
-                sendSocket.bind(new InetSocketAddress(localPort));
+        if (activated) {
+            try {
+                sendSocket = new DatagramSocket();
+                sendSocket.setReuseAddress(true);
+                if (localPort != -1) sendSocket.bind(new InetSocketAddress(localPort));
+                if (preferredNetwork != null) preferredNetwork.bindSocket(sendSocket);
+                localPort = sendSocket.getLocalPort();
+                this.activated = true;
+                receiveData();
+            } catch (SocketException error) {
+                this.activated = false;
+                if (sendSocket != null) { sendSocket.close(); sendSocket = null; }
+                throw error;
+            } catch (IOException error) {
+                this.activated = false;
+                if (sendSocket != null) { sendSocket.close(); sendSocket = null; }
+                throw new SocketException("UDP setup failed: " + error.getMessage());
+            } catch (RuntimeException error) {
+                this.activated = false;
+                if (sendSocket != null) { sendSocket.close(); sendSocket = null; }
+                throw new SocketException("UDP setup failed: " + error.getMessage());
             }
-
-            //更新一下本地端口值
-            localPort = sendSocket.getLocalPort();
-            Log.e(TAG, "openUdpPort: " + sendSocket.getLocalPort());
-            //Log.e(TAG, "openUdpIp: " + sendSocket.getLocalAddress());
-
-
-            receiveData();
         } else {
             // HF Digital Modes: let what is queued (the disconnect and logout packets) go out before the socket closes -
             // FT8CN closed it at once, so the radio never heard the app leave and kept the session for a minute or two.
@@ -246,7 +262,8 @@ public class IcomUdpClient {
 
     private static boolean wrongSource(java.net.DatagramPacket packet, IcomUdpClient client) {
         String expected = client.expectedRemoteIp;
-        return expected != null && packet.getAddress() != null && !expected.equals(packet.getAddress().getHostAddress());
+        if (expected != null && (packet.getAddress() == null || !expected.equals(packet.getAddress().getHostAddress()))) return true;
+        return client.expectedRemotePort > 0 && packet.getPort() != client.expectedRemotePort;
     }
 
     private static class DoReceiveRunnable implements Runnable {

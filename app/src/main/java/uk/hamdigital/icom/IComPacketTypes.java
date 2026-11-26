@@ -57,7 +57,8 @@ public class IComPacketTypes {
     public static final long WATCH_DOG_ALERT_MS = 2000;//触发数据接收状况报警的阈值
     public static final long METER_TIMER_PERIOD_MS = 500;//检查meter的时钟周期
 
-    public static final int AUDIO_SAMPLE_RATE = 12000;//音频的采样率，这是FT8CN发送给iCom使用的采样率
+    public static final int AUDIO_SAMPLE_RATE = 12000;
+    public static final int AUDIO_RX_SAMPLE_RATE = 48000;//音频的采样率，这是FT8CN发送给iCom使用的采样率
     public static final int XIEGU_AUDIO_SAMPLE_RATE = 48000;//音频的采样率，这是FT8CN发送给XIEGU使用的采样率
 
     public static final short CODEC_ALL_SUPPORTED = 0x018b;

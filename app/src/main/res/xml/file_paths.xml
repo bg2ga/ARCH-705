@@ -1,7 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Files other apps may be given or write: the logbook and SSTV pictures (shared), and the camera's photo for SSTV
-     (written into the cache by the camera app). -->
 <paths>
-    <files-path name="files" path="." />
-    <cache-path name="cache" path="." />
+    <files-path name="logbook" path="log.adi" />
 </paths>

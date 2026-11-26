@@ -68,13 +68,13 @@ public abstract class WifiRig {
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build();
-        AudioFormat myFormat = new AudioFormat.Builder().setSampleRate(IComPacketTypes.AUDIO_SAMPLE_RATE)
+        AudioFormat myFormat = new AudioFormat.Builder().setSampleRate(IComPacketTypes.AUDIO_RX_SAMPLE_RATE)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build();
         int mySession = 0;
 
         audioTrack = new AudioTrack(attributes, myFormat
-                , IComPacketTypes.AUDIO_SAMPLE_RATE * 4, AudioTrack.MODE_STREAM
+                , IComPacketTypes.AUDIO_RX_SAMPLE_RATE * 4, AudioTrack.MODE_STREAM
                 , mySession);
         audioTrack.play();
     }

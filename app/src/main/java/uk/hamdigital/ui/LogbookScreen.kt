@@ -42,7 +42,6 @@ import kotlinx.coroutines.withContext
 import uk.hamdigital.MainViewModel
 import uk.hamdigital.core.Locator
 import uk.hamdigital.core.Logbook
-import uk.hamdigital.core.Mode
 import uk.hamdigital.core.Qso
 import uk.hamdigital.core.Settings
 import uk.hamdigital.rig.Ic705
@@ -55,10 +54,7 @@ import java.time.format.DateTimeFormatter
 private val SHOWN = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneOffset.UTC) // a contact's time in the list
 private val DAY = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC)        // the form's date
 private val CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneOffset.UTC)         // the form's times
-private val LOG_MODES = listOf("FT8", "FT4", "FT2", "JS8", "RTTY", "PSK31", "CW", "SSB", "FM", "AM")  // quick choices in the form
-
-/** The log's name for a page's mode ("JS8Call" is logged as ADIF's "JS8"). */
-fun logMode(m: Mode) = if (m == Mode.JS8) "JS8" else m.title
+private val LOG_MODES = listOf("USB", "LSB", "AM", "FM", "CW", "CW-R", "RTTY", "DV")
 
 /** A new contact for [mode]: now, the radio's frequency, your station, the usual report for the mode. */
 fun newQso(mode: String, s: Settings): Qso {
@@ -80,7 +76,6 @@ fun LogbookScreen(vm: MainViewModel) {
     var menu by remember { mutableStateOf(false) }        // the ⋮ menu open
     var askAll by remember { mutableStateOf(false) }      // "delete everything?" showing
     var note by remember { mutableStateOf("") }           // the result of an import / save
-    var mapOpen by remember { mutableStateOf(false) }     // the map showing
     val ctyReady by uk.hamdigital.core.Cty.loaded.collectAsStateWithLifecycle() // (countries arrive after the download)
     val q = query.trim()
     val shown = remember(all, q, bandSel, modeSel, ctyReady) { // the contacts that match
@@ -104,7 +99,7 @@ fun LogbookScreen(vm: MainViewModel) {
         }
     }
     ModeFrame("Logbook", { vm.back() }, actions = {
-        TextButton({ editing = newQso(logMode(Mode.FT8), s).copy(mode = ""); isNew = true }) { uk.hamdigital.ui.Text("Add", color = Pal.Text2) }
+        TextButton({ editing = newQso("", s); isNew = true }) { uk.hamdigital.ui.Text("Add", color = Pal.Text2) }
         Box {
             IconButton({ menu = true }) { Icon(Icons.Filled.MoreVert, "Logbook menu", tint = Pal.Text2) }
             DropdownMenu(menu, { menu = false }) {
@@ -139,60 +134,21 @@ fun LogbookScreen(vm: MainViewModel) {
             uk.hamdigital.ui.Text("${shown.size} contact${if (shown.size == 1) "" else "s"}" + (if (shown.size != all.size) " of ${all.size}" else "") +
                 "  •  ${plural(shown.map { it.call }.distinct().size, "station")}  •  ${plural(countries, "country", "countries")}  •  ${plural(grids, "square")}  •  " +
                 plural(shown.map { it.bandName }.filter { it.isNotEmpty() }.distinct().size, "band"), color = Pal.Text2, fontSize = 13.sp, modifier = Modifier.weight(1f))
-            FilledTonalButton({ mapOpen = true }, enabled = shown.isNotEmpty(), contentPadding = PaddingValues(horizontal = 14.dp)) { uk.hamdigital.ui.Text("Map") } // the contacts shown, on a map
         }
         LazyColumn(Modifier.fillMaxSize()) {
             items(shown, key = { it.id }) { c -> QsoRow(c, s.locator) { editing = c; isNew = false } } // tap: change it
             if (shown.isEmpty()) item {
-                uk.hamdigital.ui.Text(if (all.isEmpty()) "No contacts yet. Completed FT8 and FT4 contacts are logged automatically; for the other modes use the Log " +
-                    "button on the mode's page, or Add here. The ⋮ menu imports a log from another program (ADIF)." else "No contacts match.",
+                uk.hamdigital.ui.Text(if (all.isEmpty()) "No contacts yet. Use Add here to create a contact, or import an ADIF log from another program." else "No contacts match.",
                     color = Pal.Dim, fontSize = 13.sp, lineHeight = 17.sp, modifier = Modifier.padding(8.dp))
             }
         }
     }
     editing?.let { e -> QsoEditor(e, isNew) { editing = null } } // the form, over the list
-    if (mapOpen) LogMap(shown, s.locator) { mapOpen = false } // the map of the contacts shown
     if (askAll) AlertDialog({ askAll = false }, confirmButton = { TextButton({ Logbook.deleteAll(); askAll = false; note = "The log was emptied" }) { uk.hamdigital.ui.Text("Delete all", color = Pal.Red) } },
         dismissButton = { TextButton({ askAll = false }) { uk.hamdigital.ui.Text("Keep them") } }, title = { uk.hamdigital.ui.Text("Delete all ${all.size} contacts?") },
         text = { uk.hamdigital.ui.Text("This cannot be undone. Save a copy first (⋮ > Save to a file) if you may want them again.") })
 }
 
-/** The map of [list] (the contacts the Logbook shows): one dot per station - at its locator, else its country's middle -
- *  coloured by the band of the latest contact, with what was logged when tapped. */
-@Composable
-private fun LogMap(list: List<Qso>, myGrid: String, onClose: () -> Unit) {
-    val home = Locator.toLatLon(myGrid)               // you
-    val byCall = list.groupBy { it.call }             // (newest first within each)
-    var unplaced = 0                                  // no locator, country unknown
-    val points = byCall.mapNotNull { (call, qs) ->
-        val c = qs.first()                            // the latest contact
-        val ll = Locator.toLatLon(c.grid) ?: qs.firstNotNullOfOrNull { Locator.toLatLon(it.grid) } // its locator (from any contact)
-        val ent = if (ll == null) uk.hamdigital.core.Cty.lookup(call) else null // else its country's middle
-        val at = ll ?: ent?.let { it.lat to it.lon } ?: run { unplaced++; return@mapNotNull null }
-        val km = if (myGrid.isNotEmpty() && ll != null) Locator.toLatLon(myGrid)?.let { h -> greatKm(h.first, h.second, at.first, at.second) } else null
-        val detail = listOfNotNull(SHOWN.format(Instant.ofEpochMilli(c.startMs)) + " UTC", "${c.bandName} ${c.mode}".trim(),
-            if (c.rstSent.isNotEmpty() || c.rstRcvd.isNotEmpty()) "sent ${c.rstSent.ifEmpty { "-" }}, rcvd ${c.rstRcvd.ifEmpty { "-" }}" else null,
-            c.grid.ifEmpty { null }, km?.let { "$it km" }, c.countryName.ifEmpty { null }, c.name.ifEmpty { null },
-            if (qs.size > 1) "${qs.size} contacts" else null).joinToString("  •  ")
-        MapPoint(at.first, at.second, call, detail, bandColor(c.bandName), exact = ll != null)
-    }
-    val bands = list.map { it.bandName }.filter { it.isNotEmpty() }.distinct().sortedBy { Logbook.BANDS.indexOf(it) }
-    MapDialog("Contacts map", points, home, onClose,
-        note = "${points.size} station${if (points.size == 1) "" else "s"}" + (if (unplaced > 0) " ($unplaced not placed: no locator or known country)" else "") +
-            (if (home == null) ". Set your locator in Settings to show yourself." else ". Pinch to zoom, drag to move, tap a dot."),
-        legend = {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) { // the bands' colours
-                bands.forEach { b -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(Modifier.size(10.dp).background(bandColor(b), androidx.compose.foundation.shape.CircleShape)); uk.hamdigital.ui.Text(" $b", color = Pal.Text2, fontSize = 12.sp) } }
-            }
-        })
-}
-
-/** Great-circle distance in km. */
-private fun greatKm(la1: Double, lo1: Double, la2: Double, lo2: Double): Int {
-    val r = Math.PI / 180
-    return (6371 * Math.acos((Math.sin(la1 * r) * Math.sin(la2 * r) + Math.cos(la1 * r) * Math.cos(la2 * r) * Math.cos((lo2 - lo1) * r)).coerceIn(-1.0, 1.0))).toInt()
-}
 
 /** One contact in the list: time, call, country, band and mode; reports, locator, distance, name and comment under it. */
 @Composable

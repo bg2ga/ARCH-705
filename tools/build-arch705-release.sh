@@ -9,7 +9,7 @@ IC705_KEY_PASSWORD=${IC705_KEY_PASSWORD//$'\r'/}
 export IC705_KEYSTORE_PASSWORD IC705_KEY_PASSWORD
 export ANDROID_HOME=/work/android-sdk
 export ANDROID_SDK_ROOT=/work/android-sdk
-export GRADLE_USER_HOME=/work/project/.gradle-release-home
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-/work/project/.gradle-release-home}"
 export ANDROID_USER_HOME=/work/project/.android-home
 cd /work/project
 mkdir -p "$GRADLE_USER_HOME" "$ANDROID_USER_HOME"
@@ -48,7 +48,7 @@ TEST_HASH=$(find app/build/test-results/testDebugUnitTest -name 'TEST-*.xml' -pr
 LINT_HASH=$(sha256sum app/build/reports/lint-results-debug.html | cut -d' ' -f1)
 NOTES_HASH=$(sha256sum "release-notes-$VERSION_NAME.md" | cut -d' ' -f1)
 SOURCE_TGZ="/artifacts/ARCH-705-source-$VERSION_NAME.tar.gz"
-tar --exclude=.gradle --exclude=.gradle-user --exclude=.gradle-release-home --exclude=.android-home --exclude=build --exclude=app/build -czf "$SOURCE_TGZ" .
+tar --exclude=build --exclude=app/build -czf "$SOURCE_TGZ" app/src gradle tools build.gradle.kts settings.gradle.kts gradle.properties README.md LICENSE THIRD_PARTY_NOTICES.md "release-notes-$VERSION_NAME.md"
 SOURCE_TAR_HASH=$(sha256sum "$SOURCE_TGZ" | cut -d' ' -f1)
 APK_HASH=$(sha256sum "$APK" | cut -d' ' -f1)
 cat > "/artifacts/ARCH-705-$VERSION_NAME-build-manifest.json" <<EOF

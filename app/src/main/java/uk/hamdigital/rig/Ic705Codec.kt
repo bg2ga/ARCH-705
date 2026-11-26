@@ -25,6 +25,8 @@ internal object Ic705Codec {
         }
     }
 
+    fun offsetValue(data: List<Int>, at: Int = 0): Long = frequencyValue(data, at) * 10L
+
     fun frequencyValue(data: List<Int>, at: Int = 0): Long {
         var hz = 0L
         var multiplier = 1L

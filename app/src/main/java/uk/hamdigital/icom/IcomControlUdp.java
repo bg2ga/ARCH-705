@@ -6,6 +6,7 @@ package uk.hamdigital.icom;
  * @date 2023-03-20
  */
 
+import android.net.Network;
 import android.util.Log;
 
 import java.net.DatagramPacket;
@@ -17,13 +18,16 @@ public class IcomControlUdp extends ControlUdp {
 
 
     public IcomControlUdp(String userName, String password, String remoteIp, int remotePort,
-                          int civRigPortOverride, int audioRigPortOverride) {
+                          int civRigPortOverride, int audioRigPortOverride, Network preferredNetwork) {
         super(userName,password,remoteIp,remotePort);
+        this.preferredNetwork = preferredNetwork;
         this.civRigPortOverride = civRigPortOverride;
         this.audioRigPortOverride = audioRigPortOverride;
 
         civUdp = new IcomCivUdp();
         audioUdp = new IcomAudioUdp();
+        civUdp.setPreferredNetwork(preferredNetwork);
+        audioUdp.setPreferredNetwork(preferredNetwork);
 
         civUdp.rigIp = remoteIp;
         audioUdp.rigIp = remoteIp;
@@ -50,7 +54,7 @@ public class IcomControlUdp extends ControlUdp {
                             , localId, remoteId
                             , (byte) 0x01, (byte) 0x03, nextInnerSeq(), localToken, rigToken
                             , rigName, userName
-                            , IComPacketTypes.AUDIO_SAMPLE_RATE//接收12000采样率
+                            , IComPacketTypes.AUDIO_RX_SAMPLE_RATE//接收 PCM：IC-705 WLAN 实测 48000
                             , IComPacketTypes.AUDIO_SAMPLE_RATE//发射12000采样率
                             , civUdp.localPort, audioUdp.localPort
                             , IComPacketTypes.XIEGU_TX_BUFFER_SIZE));//0x96是wfView常用的缓冲区长度

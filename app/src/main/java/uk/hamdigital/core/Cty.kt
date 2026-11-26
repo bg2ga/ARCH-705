@@ -31,7 +31,12 @@ object Cty {
 
     private fun download(): String? = try {
         val c = URL("https://www.country-files.com/cty/cty.dat").openConnection() as HttpURLConnection
-        try { c.connectTimeout = 15_000; c.readTimeout = 30_000; if (c.responseCode == 200) c.inputStream.bufferedReader().use { it.readText() } else null } finally { c.disconnect() }
+        try {
+            c.connectTimeout = 15_000; c.readTimeout = 30_000; c.instanceFollowRedirects = false
+            if (c.responseCode != 200) return null
+            val text = c.inputStream.bufferedReader().use { it.readText() }
+            text.takeIf { it.length in 50_000..1_500_000 && it.contains(':') && it.contains(';') }
+        } finally { c.disconnect() }
     } catch (e: Exception) { null }
 
     private fun parse(t: String) {

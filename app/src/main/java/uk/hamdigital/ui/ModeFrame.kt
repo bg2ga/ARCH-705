@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
 import uk.hamdigital.audio.AudioIn
+import uk.hamdigital.audio.AudioOut
 import uk.hamdigital.audio.Spectrum
 import uk.hamdigital.core.AudioChoice
 import kotlin.math.log10
@@ -70,7 +71,7 @@ fun ModeFrame(title: String, onBack: () -> Unit, showBack: Boolean = true, actio
                 fontFamily = OrbitronFamily,
                 fontWeight = FontWeight.Bold,
                 color = if (title == "ARCH-705") Pal.Text else Pal.Text2,
-                fontSize = if (title == "ARCH-705") 20.sp else 21.sp,
+                fontSize = if (title == "ARCH-705") 18.sp else 21.sp,
                 letterSpacing = (-0.3).sp,
                 maxLines = 1,
                 softWrap = false,
@@ -87,22 +88,35 @@ fun ModeFrame(title: String, onBack: () -> Unit, showBack: Boolean = true, actio
 class RxState { var error by mutableStateOf<String?>(null); var running by mutableStateOf(false) } // what went wrong / capturing
 
 @Composable
-fun rememberRx(rate: Int, block: Int, choice: AudioChoice, sink: (ShortArray, Int) -> Unit): RxState {
+fun rememberRx(rate: Int, block: Int, choice: AudioChoice, monitorWifi: Boolean = true, sink: (ShortArray, Int) -> Unit): RxState {
     val ctx = LocalContext.current
     val st = remember { RxState() }
+    val audioOwner = remember { Any() }
+    val usbPresent = remember(choice) { AudioIn.usbInput(ctx) != null }
     val wifiLoggedIn by uk.hamdigital.rig.IcomNet.loginState.collectAsStateWithLifecycle()
-    val actualChoice = if (wifiLoggedIn) AudioChoice.WIFI else choice
+    val actualChoice = if (wifiLoggedIn || uk.hamdigital.rig.IcomNet.loggedIn) AudioChoice.WIFI else choice
+    val useWifi = actualChoice == AudioChoice.WIFI || (actualChoice == AudioChoice.AUTO && uk.hamdigital.rig.IcomNet.loggedIn)
+    val monitorRx = monitorWifi && (useWifi || actualChoice == AudioChoice.USB || (actualChoice == AudioChoice.AUTO && usbPresent))
     fun go(use: AudioChoice) {
-        st.error = AudioIn.start(ctx, st, use, rate, block, sink)
+        val monitored: (ShortArray, Int) -> Unit = { b, n ->
+            if (monitorRx) AudioOut.writePcm(b, n, rate)
+            sink(b, n)
+        }
+        st.error = AudioIn.start(ctx, st, use, rate, block, monitored)
         st.running = st.error == null
     }
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) go(actualChoice) else st.error = "未允许音频权限，请到 Android 设置 > 应用 > ARCH-705 > 权限中开启"
     }
     DisposableEffect(actualChoice) {
-        if (actualChoice == AudioChoice.WIFI || AudioIn.allowed(ctx)) go(actualChoice)
+        if (monitorRx) AudioOut.open(audioOwner)
+        if (useWifi || AudioIn.allowed(ctx)) go(actualChoice)
         else ask.launch(android.Manifest.permission.RECORD_AUDIO)
-        onDispose { AudioIn.stop(st); st.running = false }
+        onDispose {
+            AudioIn.stop(st)
+            st.running = false
+            if (monitorRx) AudioOut.close(audioOwner)
+        }
     }
     return st
 }
@@ -113,12 +127,14 @@ fun RxStatus(rx: RxState, extra: String = "") {
     var lvl by remember { mutableFloatStateOf(0f) }   // input level, refreshed
     var link by remember { mutableStateOf("") }       // the WiFi link's state while it is not up ("" = up, or not WiFi)
     var loss by remember { mutableStateOf("") }       // WiFi audio packets lost / recovered (shown once any are)
+    val outError by AudioOut.error.collectAsStateWithLifecycle()
+    val captureError by AudioIn.captureError.collectAsStateWithLifecycle()
     LaunchedEffect(Unit) { while (true) { lvl = AudioIn.level
         link = if (AudioIn.wifi && !uk.hamdigital.rig.IcomNet.loggedIn) "WiFi: ${uk.hamdigital.rig.IcomNet.status.value.ifEmpty { "未连接，请到设置页检查连接" }}" else ""
         loss = if (AudioIn.wifi) uk.hamdigital.rig.IcomNet.rxAudioStats()?.takeIf { it[1] + it[2] > 0 }?.let { "  •  WiFi 音频：丢失 %d，恢复 %d，共 %d".format(it[1], it[2], it[0]) } ?: "" else ""
         delay(100) } }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        uk.hamdigital.ui.Text(rx.error ?: link.ifEmpty { if (rx.running) "音频：${AudioIn.sourceName}$loss" else "正在启动音频…" }, color = if (rx.error != null) Pal.Red else if (link.isNotEmpty()) Pal.Amber else Pal.Text2,
+        uk.hamdigital.ui.Text(rx.error ?: outError ?: captureError ?: link.ifEmpty { if (rx.running) "音频：${AudioIn.sourceName}$loss" else "正在启动音频…" }, color = if (rx.error != null || outError != null || captureError != null) Pal.Red else if (link.isNotEmpty()) Pal.Amber else Pal.Text2,
             fontSize = 13.sp, modifier = Modifier.weight(1f), maxLines = 2)
         if (extra.isNotEmpty()) uk.hamdigital.ui.Text(extra, color = Pal.Amber, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 8.dp)) // the page's own note
         val db = if (lvl > 0.001f) 20 * log10(lvl) else -60f // level in dB

@@ -44,6 +44,9 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uk.hamdigital.ArchFloatingPttService
 import uk.hamdigital.ArchOverlayService
 import uk.hamdigital.BuildConfigInfo
@@ -74,39 +77,71 @@ private const val ABOUT = "about"
 fun SettingsScreen(vm: MainViewModel) {
     val s by vm.settings.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
-    val active = RadioProfiles.active(ctx)
+    val scope = rememberCoroutineScope()
+    var active by remember { mutableStateOf<RadioProfile?>(null) }
     val rig by Ic705.state.collectAsStateWithLifecycle()
     val net by IcomNet.status.collectAsStateWithLifecycle()
     val loggedIn by IcomNet.loginState.collectAsStateWithLifecycle()
     val authAcceptedGeneration by IcomNet.authAcceptedGeneration.collectAsStateWithLifecycle()
     val authenticatedGeneration by IcomNet.authenticatedGeneration.collectAsStateWithLifecycle()
     var section by rememberSaveable { mutableStateOf<String?>(null) }
-    var call by remember { mutableStateOf(s.callsign) }
-    var loc by remember { mutableStateOf(s.locator) }
-    var profiles by remember { mutableStateOf(RadioProfiles.load(ctx)) }
-    var saveName by remember { mutableStateOf(false) }
-    var profileName by remember { mutableStateOf("") }
-    var address by remember { mutableStateOf(s.wifiIp.ifBlank { active?.address.orEmpty() }) }
-    var user by remember { mutableStateOf(s.wifiUser.ifBlank { active?.user.orEmpty() }) }
+    var call by rememberSaveable { mutableStateOf(s.callsign) }
+    var loc by rememberSaveable { mutableStateOf(s.locator) }
+    var profiles by remember { mutableStateOf(emptyList<RadioProfile>()) }
+    var saveName by rememberSaveable { mutableStateOf(false) }
+    var profileName by rememberSaveable { mutableStateOf("") }
+    var address by rememberSaveable { mutableStateOf(s.wifiIp.ifBlank { active?.address.orEmpty() }) }
+    var user by rememberSaveable { mutableStateOf(s.wifiUser.ifBlank { active?.user.orEmpty() }) }
     var password by remember { mutableStateOf(active?.password.orEmpty()) }
-    var defaults by remember { mutableStateOf(s.useDefaultPorts) }
-    var control by remember { mutableStateOf(s.wifiPort.toString()) }
-    var serial by remember { mutableStateOf(s.wifiCivPort.toString()) }
-    var audio by remember { mutableStateOf(s.wifiAudioPort.toString()) }
-    var updateStatus by remember { mutableStateOf("") }
-    var exitAsk by remember { mutableStateOf(false) }
+    var defaults by rememberSaveable { mutableStateOf(s.useDefaultPorts) }
+    var control by rememberSaveable { mutableStateOf(s.wifiPort.toString()) }
+    var serial by rememberSaveable { mutableStateOf(s.wifiCivPort.toString()) }
+    var audio by rememberSaveable { mutableStateOf(s.wifiAudioPort.toString()) }
+    var updateStatus by rememberSaveable { mutableStateOf("") }
+    var profileError by rememberSaveable { mutableStateOf("") }
+    var exitAsk by rememberSaveable { mutableStateOf(false) }
     var pendingProfile by remember { mutableStateOf<RadioProfile?>(null) }
     var pendingGeneration by remember { mutableStateOf(0L) }
     val updater = remember { (ctx as? Activity)?.let { Updater(it) } }
     val logs by Logbook.qsos.collectAsStateWithLifecycle()
     var usbAudio by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) { updater?.resumePendingInstall() }
+    LaunchedEffect(Unit) {
+        updater?.resumePendingInstall()
+        val (snapshot, activeId) = withContext(Dispatchers.IO) {
+            RadioProfiles.loadSnapshot(ctx) to RadioProfiles.activeId(ctx)
+        }
+        if (snapshot.loadFailed) {
+            profileError = "保存的电台档案读取失败。为避免覆盖数据，已禁止保存、删除和清除密码。"
+            return@LaunchedEffect
+        }
+        val loadedActive = snapshot.profiles.firstOrNull { it.id == activeId }
+        profiles = snapshot.profiles
+        active = loadedActive
+        if (loadedActive != null) {
+            address = loadedActive.address
+            user = loadedActive.user
+            password = loadedActive.password
+            defaults = loadedActive.useDefaultPorts
+            control = loadedActive.controlPort.toString()
+            serial = loadedActive.serialPort.toString()
+            audio = loadedActive.audioPort.toString()
+        }
+        if (activeId.isNotBlank() && activeId in snapshot.unreadableIds) {
+            password = ""
+            profileError = "当前电台的保存密码无法从系统密钥库解密，请重新输入密码后保存。"
+        }
+    }
     LaunchedEffect(Unit) { while (true) { usbAudio = AudioIn.usbInput(ctx)?.let { AudioIn.usbName(it) }; kotlinx.coroutines.delay(2000) } }
     BackHandler(enabled = section != null) { section = null }
     LaunchedEffect(authAcceptedGeneration, authenticatedGeneration, pendingProfile, pendingGeneration) {
         if (pendingProfile != null && pendingGeneration > 0L && (authAcceptedGeneration == pendingGeneration || authenticatedGeneration == pendingGeneration)) {
-            pendingProfile?.let { RadioProfiles.save(ctx, it) }
-            profiles = RadioProfiles.load(ctx)
+            val saved = withContext(Dispatchers.IO) {
+                val ok = pendingProfile?.let { RadioProfiles.save(ctx, it) } == true
+                ok to (RadioProfiles.load(ctx) to RadioProfiles.active(ctx))
+            }
+            profiles = saved.second.first
+            active = saved.second.second
+            if (!saved.first) profileError = "系统密钥库无法安全保存密码，请检查设备安全设置后重试。"
             pendingProfile = null
             pendingGeneration = 0L
         }
@@ -128,12 +163,26 @@ fun SettingsScreen(vm: MainViewModel) {
                     address = address.trim(), user = user.trim(), password = password,
                     controlPort = cp, serialPort = sp, audioPort = ap, useDefaultPorts = defaults,
                 )
-                RadioProfiles.save(ctx, profile)
-                profiles = RadioProfiles.load(ctx)
-                saveName = false
+                scope.launch {
+                    val (ok, loaded) = withContext(Dispatchers.IO) {
+                        val saved = RadioProfiles.save(ctx, profile)
+                        saved to (RadioProfiles.load(ctx) to RadioProfiles.active(ctx))
+                    }
+                    profiles = loaded.first
+                    active = loaded.second
+                    if (!ok) profileError = "系统密钥库无法安全保存密码，请检查设备安全设置后重试。"
+                    saveName = false
+                }
             }) { uk.hamdigital.ui.Text("保存") }
         },
         dismissButton = { TextButton({ saveName = false }) { uk.hamdigital.ui.Text("取消") } },
+    )
+
+    if (profileError.isNotBlank()) AlertDialog(
+        onDismissRequest = { profileError = "" },
+        title = { uk.hamdigital.ui.Text("保存密码失败") },
+        text = { uk.hamdigital.ui.Text(profileError) },
+        confirmButton = { TextButton({ profileError = "" }) { uk.hamdigital.ui.Text("确定") } },
     )
 
     if (exitAsk) AlertDialog(
@@ -142,11 +191,21 @@ fun SettingsScreen(vm: MainViewModel) {
         text = { uk.hamdigital.ui.Text("退出后将清除保存的电台密码。软关机和后台运行不会清除密码。") },
         confirmButton = {
             TextButton({
-                IcomNet.disconnect()
-                RadioProfiles.clearPasswords(ctx)
-                vm.updateSettings { it.copy(wifiUser = "", audio = AudioChoice.AUTO) }
+                uk.hamdigital.core.PttLock.lock()
                 exitAsk = false
-                vm.show(Screen.Connect)
+                IcomNet.disconnect {
+                    scope.launch {
+                        val cleared = withContext(Dispatchers.IO) { RadioProfiles.clearPasswords(ctx) }
+                        RadioService.stop(ctx)
+                        ArchOverlayService.stop(ctx)
+                        if (!cleared) {
+                            profileError = "无法安全清除保存的密码。为避免误以为已退出，已停止后台连接；请检查应用存储后重试。"
+                            return@launch
+                        }
+                        vm.updateSettings { it.copy(wifiUser = "", audio = AudioChoice.AUTO) }
+                        vm.show(Screen.Connect)
+                    }
+                }
             }) { uk.hamdigital.ui.Text("退出并清除密码", color = Pal.Red) }
         },
         dismissButton = { TextButton({ exitAsk = false }) { uk.hamdigital.ui.Text("取消") } },
@@ -189,13 +248,33 @@ fun SettingsScreen(vm: MainViewModel) {
                     onAddress = { address = it }, onUser = { user = it }, onPassword = { password = it },
                     onDefaults = { defaults = it }, onControl = { control = it }, onSerial = { serial = it }, onAudio = { audio = it },
                     onUseProfile = { p ->
-                        RadioProfiles.markActive(ctx, p.id)
+                        active = p
                         vm.updateSettings { p.applyTo(it) }
                         address = p.address; user = p.user; password = p.password
                         defaults = p.useDefaultPorts; control = p.controlPort.toString(); serial = p.serialPort.toString(); audio = p.audioPort.toString()
-                        profiles = RadioProfiles.load(ctx)
+                        scope.launch {
+                            val loaded = withContext(Dispatchers.IO) {
+                                RadioProfiles.markActive(ctx, p.id)
+                                RadioProfiles.load(ctx) to RadioProfiles.active(ctx)
+                            }
+                            profiles = loaded.first
+                            active = loaded.second
+                        }
                     },
-                    onDeleteProfile = { p -> RadioProfiles.delete(ctx, p.id); profiles = RadioProfiles.load(ctx) },
+                    onDeleteProfile = { p ->
+                        scope.launch {
+                            val deleted = withContext(Dispatchers.IO) { RadioProfiles.delete(ctx, p.id) }
+                            if (!deleted) {
+                                profileError = "电台档案删除失败。为避免数据损坏，现有档案未被修改。"
+                                return@launch
+                            }
+                            val loaded = withContext(Dispatchers.IO) {
+                                RadioProfiles.load(ctx) to RadioProfiles.active(ctx)
+                            }
+                            profiles = loaded.first
+                            active = loaded.second
+                        }
+                    },
                     onSaveProfile = { profileName = address.ifBlank { "IC-705" }; saveName = true },
                     onConnect = {
                         val cp = if (defaults) 50001 else control.toIntOrNull() ?: 0
@@ -215,8 +294,13 @@ fun SettingsScreen(vm: MainViewModel) {
                     onDisconnect = {
                         pendingProfile = null
                         pendingGeneration = 0L
-                        IcomNet.disconnect()
-                        vm.updateSettings { it.copy(audio = AudioChoice.AUTO) }
+                        IcomNet.suppressAutoLogin()
+                        uk.hamdigital.core.PttLock.lock()
+                        IcomNet.disconnect {
+                            RadioService.stop(ctx)
+                            ArchOverlayService.stop(ctx)
+                            vm.updateSettings { it.copy(audio = AudioChoice.AUTO, backgroundKeepAlive = false, backgroundAudio = false, floatingPtt = false) }
+                        }
                     },
                 )
                 STATION -> StationSection(call, loc, onCall = {
@@ -260,7 +344,7 @@ private fun SettingsHome(
     SettingsRow(Icons.Filled.Person, "我的台站", callsign.ifBlank { "呼号与网格" }, Pal.Amber) { onSection(STATION) }
     SettingsRow(Icons.AutoMirrored.Filled.VolumeUp, "音频与发射", audioLabel(audio) + " · 悬浮PTT " + if (floatingPtt) "开" else "关", Color(0xFF70D4B4)) { onSection(AUDIO) }
     SettingsRow(Icons.Filled.Palette, "显示与频谱", "刷新率 $refreshFps FPS", Color(0xFF65AFFF)) { onSection(DISPLAY) }
-    SettingsRow(Icons.Filled.Memory, "固件兼容", "原版 1.40 / ARCH 数字状态扩展", Pal.Cyan) { onSection(FIRMWARE) }
+    SettingsRow(Icons.Filled.Memory, "固件兼容", "原版 1.40 / BI1BIF v1.5.0 标准兼容", Pal.Cyan) { onSection(FIRMWARE) }
     GroupTitle("记录与帮助")
     SettingsRow(Icons.AutoMirrored.Filled.ListAlt, "通联日志记录", "$logCount 条通联", Pal.Green, onLog)
     SettingsRow(Icons.Filled.SystemUpdate, "检查更新", "在线检查并安装新版本", Pal.Cyan) { onSection(UPDATE) }
@@ -322,7 +406,7 @@ private fun StationSection(call: String, loc: String, onCall: (String) -> Unit, 
     GroupTitle("本台资料")
     CompactField(call, onCall, "呼号", Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters))
     CompactField(loc, onLoc, "Maidenhead 网格", Modifier.fillMaxWidth(), isError = loc.isNotBlank() && !LOCATOR.matches(loc), keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters))
-    uk.hamdigital.ui.Text("示例：呼号 BG2GA，网格 PN35AA。日志、WSPR 和 APRS 会使用这些资料。", color = Pal.Muted, fontSize = 11.sp, lineHeight = 16.sp)
+    uk.hamdigital.ui.Text("示例：呼号 BG2GA，网格 PN35AA。通联日志会使用这些资料。", color = Pal.Muted, fontSize = 11.sp, lineHeight = 16.sp)
 }
 
 @Composable
@@ -333,8 +417,15 @@ private fun AudioSection(vm: MainViewModel, s: uk.hamdigital.core.Settings, usbA
     uk.hamdigital.ui.Text(usbAudio?.let { "已发现 USB 音频：" + it } ?: "未发现 USB 音频", color = if (usbAudio != null) Pal.Green else Pal.Muted, fontSize = 11.sp)
     GroupTitle("后台")
     ToggleRow("后台常驻", "息屏或切到其他应用时保持电台连接；默认开启", s.backgroundKeepAlive) { enabled ->
-        vm.updateSettings { it.copy(backgroundKeepAlive = enabled) }
-        if (enabled) RadioService.start(ctx) else RadioService.stop(ctx)
+        vm.updateSettings {
+            if (enabled) it.copy(backgroundKeepAlive = true)
+            else it.copy(backgroundKeepAlive = false, backgroundAudio = false, floatingPtt = false)
+        }
+        if (enabled) RadioService.start(ctx) else {
+            RadioService.stop(ctx)
+            ArchOverlayService.stop(ctx)
+            ArchFloatingPttService.refresh(ctx)
+        }
     }
     ToggleRow("后台音频", "APP 在后台时继续播放 IC-705 接收音频；默认关闭，需要耗电和流量", s.backgroundAudio) { enabled ->
         vm.updateSettings { it.copy(backgroundAudio = enabled, backgroundKeepAlive = if (enabled) true else it.backgroundKeepAlive) }
@@ -397,16 +488,16 @@ private fun DisplaySection(vm: MainViewModel, s: uk.hamdigital.core.Settings) {
         }
     }
     GroupTitle("界面")
-    uk.hamdigital.ui.Text("主界面采用单页工作台布局；功能模式、设置和日志从右上角进入。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
+    uk.hamdigital.ui.Text("主界面采用单页工作台布局；设置和日志从右上角进入。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
 }
 
 @Composable
 private fun FirmwareSection() {
     GroupTitle("兼容范围")
-    uk.hamdigital.ui.Text("原版 IC-705 1.40：标准 CI-V / RS-BA1 控制、音频、频谱、PTT 正常工作。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
-    uk.hamdigital.ui.Text("BI1BIF v1.5.3：支持 DMR、YSF/C4FM、常规 P25 Phase 1 接收。SD 卡 IC-705 目录必须保留 DMRRX.BIN。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
-    uk.hamdigital.ui.Text("ARCH-705 数字状态扩展固件：在 v1.5.3 基础上增加只读 A7DV 状态帧，App 可显示色码、时隙、ID、组呼、DG-ID、呼号和 NAC。", color = Pal.Cyan, fontSize = 12.sp, lineHeight = 17.sp)
-    uk.hamdigital.ui.Text("扩展固件不会修改解码结果，也不会伪造状态；未刷扩展固件时，原有功能不受影响。", color = Pal.Muted, fontSize = 11.sp, lineHeight = 16.sp)
+    uk.hamdigital.ui.Text("原版 IC-705 1.40：标准 CI-V / RS-BA1 控制、音频、频谱和 PTT 正常工作。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
+    uk.hamdigital.ui.Text("BI1BIF v1.5.0：兼容原厂 CI-V / RS-BA1 网络接口，标准控制与音频链路保持一致。", color = Pal.Text2, fontSize = 12.sp, lineHeight = 17.sp)
+    uk.hamdigital.ui.Text("本版本为纯标准遥控基线，不包含手机端 SDR/DSP 数字语音或数据模式解码。固件扩展能力将在独立版本中重新适配。", color = Pal.Cyan, fontSize = 12.sp, lineHeight = 17.sp)
+    uk.hamdigital.ui.Text("远程发射必须开启 IC-705 本机 TX Time-out Timer，并确认假负载或天线、功率与 SWR。", color = Pal.Muted, fontSize = 11.sp, lineHeight = 16.sp)
 }
 
 @Composable

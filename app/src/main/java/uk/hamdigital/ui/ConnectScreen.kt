@@ -22,6 +22,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import uk.hamdigital.MainViewModel
 import uk.hamdigital.Screen
 import uk.hamdigital.core.AudioChoice
@@ -34,25 +36,22 @@ import uk.hamdigital.rig.RigState
 @Composable
 fun ConnectScreen(vm: MainViewModel) {
     val saved by vm.settings.collectAsStateWithLifecycle()
+    val settingsReady by vm.settingsReady.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
-    val active = remember {
-        val profiles = RadioProfiles.load(ctx)
-        RadioProfiles.active(ctx)?.takeIf { it.password.isNotBlank() }
-            ?: profiles.firstOrNull { it.password.isNotBlank() }
-            ?: RadioProfiles.active(ctx)
-    }
+    var active by remember { mutableStateOf<RadioProfile?>(null) }
+    var profiles by remember { mutableStateOf(emptyList<RadioProfile>()) }
     val rig by Ic705.state.collectAsStateWithLifecycle()
     val status by IcomNet.status.collectAsStateWithLifecycle()
     val loggedIn by IcomNet.loginState.collectAsStateWithLifecycle()
     val authAcceptedGeneration by IcomNet.authAcceptedGeneration.collectAsStateWithLifecycle()
     val authenticatedGeneration by IcomNet.authenticatedGeneration.collectAsStateWithLifecycle()
-    var address by remember { mutableStateOf(active?.address ?: saved.wifiIp) }
-    var user by remember { mutableStateOf(active?.user ?: saved.wifiUser) }
+    var address by rememberSaveable { mutableStateOf(active?.address ?: saved.wifiIp) }
+    var user by rememberSaveable { mutableStateOf(active?.user ?: saved.wifiUser) }
     var password by remember { mutableStateOf(active?.password ?: "") }
-    var defaults by remember { mutableStateOf(active?.useDefaultPorts ?: saved.useDefaultPorts) }
-    var control by remember { mutableStateOf((active?.controlPort ?: saved.wifiPort).toString()) }
-    var serial by remember { mutableStateOf((active?.serialPort ?: saved.wifiCivPort).toString()) }
-    var audio by remember { mutableStateOf((active?.audioPort ?: saved.wifiAudioPort).toString()) }
+    var defaults by rememberSaveable { mutableStateOf(active?.useDefaultPorts ?: saved.useDefaultPorts) }
+    var control by rememberSaveable { mutableStateOf((active?.controlPort ?: saved.wifiPort).toString()) }
+    var serial by rememberSaveable { mutableStateOf((active?.serialPort ?: saved.wifiCivPort).toString()) }
+    var audio by rememberSaveable { mutableStateOf((active?.audioPort ?: saved.wifiAudioPort).toString()) }
     var error by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var pendingProfile by remember { mutableStateOf<RadioProfile?>(null) }
@@ -60,21 +59,42 @@ fun ConnectScreen(vm: MainViewModel) {
     var pendingSavedGeneration by remember { mutableStateOf(0L) }
     var loginStartedMs by remember { mutableLongStateOf(0L) }
     var powerWaitExpired by remember { mutableStateOf(false) }
+    var profileSaveFailed by remember { mutableStateOf(false) }
+    var profileSaveWarning by remember { mutableStateOf(false) }
+    var proceedWithoutSavedProfile by remember { mutableStateOf(false) }
+    var suppressAutoNavigation by remember { mutableStateOf(false) }
 
-    LaunchedEffect(rig.link, authAcceptedGeneration, authenticatedGeneration, pendingProfile, pendingGeneration) {
-        if (pendingProfile != null && pendingGeneration > 0L && authAcceptedGeneration == pendingGeneration &&
+    LaunchedEffect(rig.link, authAcceptedGeneration, authenticatedGeneration, pendingProfile, pendingGeneration, profileSaveFailed, proceedWithoutSavedProfile, suppressAutoNavigation) {
+        val profile = pendingProfile
+        if (profile != null && pendingGeneration > 0L && authAcceptedGeneration == pendingGeneration &&
             pendingSavedGeneration != pendingGeneration) {
-            pendingProfile?.let { RadioProfiles.save(ctx, it) }
+            val ok = withContext(Dispatchers.IO) { RadioProfiles.save(ctx, profile) }
+            profileSaveFailed = !ok
+            if (!ok) error = "登录成功，但系统密钥库无法安全保存密码。"
             pendingSavedGeneration = pendingGeneration
         }
         if (rig.link == RigState.Link.CONNECTED && pendingGeneration > 0L &&
             authenticatedGeneration == pendingGeneration) {
-            if (pendingProfile != null && pendingSavedGeneration != pendingGeneration) {
-                pendingProfile?.let { RadioProfiles.save(ctx, it) }
+            if (profile != null && pendingSavedGeneration != pendingGeneration) {
+                val ok = withContext(Dispatchers.IO) { RadioProfiles.save(ctx, profile) }
+                profileSaveFailed = !ok
+                if (!ok) error = "登录成功，但系统密钥库无法安全保存密码。"
             }
+            if (profileSaveFailed && !proceedWithoutSavedProfile) {
+                busy = false
+                profileSaveWarning = true
+                return@LaunchedEffect
+            }
+            if (suppressAutoNavigation) return@LaunchedEffect
             pendingProfile = null
             pendingGeneration = 0L
             pendingSavedGeneration = 0L
+            busy = false
+            vm.show(Screen.Control)
+        }
+    }
+    LaunchedEffect(loggedIn, pendingGeneration, suppressAutoNavigation) {
+        if (!suppressAutoNavigation && loggedIn && pendingGeneration == 0L) {
             busy = false
             vm.show(Screen.Control)
         }
@@ -146,6 +166,10 @@ fun ConnectScreen(vm: MainViewModel) {
         loginStartedMs = System.currentTimeMillis()
         powerWaitExpired = false
         error = ""
+        profileSaveFailed = false
+        profileSaveWarning = false
+        proceedWithoutSavedProfile = false
+        suppressAutoNavigation = false
         vm.updateSettings {
             it.copy(
                 wifiIp = address.trim(), wifiUser = user.trim(), wifiPass = "",
@@ -155,7 +179,7 @@ fun ConnectScreen(vm: MainViewModel) {
         }
         val host = address.trim()
         val name = active?.takeIf { it.address == host && it.user == user.trim() }?.name ?: host
-        val existing = RadioProfiles.load(ctx).firstOrNull { it.address == host && it.user == user.trim() }
+        val existing = profiles.firstOrNull { it.address == host && it.user == user.trim() }
         val profile = (existing ?: RadioProfile(name = name, address = host, user = user.trim(), password = password)).copy(
             address = host, user = user.trim(), password = password,
             controlPort = cp, serialPort = sp, audioPort = ap, useDefaultPorts = defaults,
@@ -164,9 +188,24 @@ fun ConnectScreen(vm: MainViewModel) {
         pendingGeneration = IcomNet.connect(ctx, host, cp, user.trim(), password, if (defaults) -1 else sp, if (defaults) -1 else ap, powerOn = wake)
     }
 
-    LaunchedEffect(Unit) {
-        val profile = active ?: return@LaunchedEffect
-        if (profile.address.isNotBlank() && profile.user.isNotBlank() && profile.password.isNotBlank()) {
+    LaunchedEffect(settingsReady) {
+        if (!settingsReady) return@LaunchedEffect
+        val (snapshot, activeId) = withContext(Dispatchers.IO) {
+            RadioProfiles.loadSnapshot(ctx) to RadioProfiles.activeId(ctx)
+        }
+        if (snapshot.loadFailed) {
+            error = "保存的电台档案读取失败，为避免覆盖数据，本次不会自动登录。请重新输入或修复应用存储。"
+            return@LaunchedEffect
+        }
+        profiles = snapshot.profiles
+        val activeProfile = snapshot.profiles.firstOrNull { it.id == activeId }
+        val activeUnreadable = activeId.isNotBlank() && activeId in snapshot.unreadableIds
+        val profile = if (activeUnreadable) activeProfile
+            else activeProfile?.takeIf { it.password.isNotBlank() }
+                ?: snapshot.profiles.firstOrNull { it.password.isNotBlank() }
+                ?: activeProfile
+        active = profile
+        if (profile != null) {
             address = profile.address
             user = profile.user
             password = profile.password
@@ -174,9 +213,43 @@ fun ConnectScreen(vm: MainViewModel) {
             control = profile.controlPort.toString()
             serial = profile.serialPort.toString()
             audio = profile.audioPort.toString()
-            connect(wake = true)
         }
+        if (activeUnreadable) {
+            password = ""
+            error = "已保存的密码无法从系统密钥库解密，请重新输入密码。"
+            return@LaunchedEffect
+        }
+        if (!IcomNet.autoLoginAllowed()) return@LaunchedEffect
+        if (IcomNet.hasActiveTarget()) {
+            busy = true
+            loginStartedMs = System.currentTimeMillis()
+            return@LaunchedEffect
+        }
+        if (profile != null && profile.address.isNotBlank() && profile.user.isNotBlank() && profile.password.isNotBlank()) connect(wake = true)
     }
+
+    if (profileSaveWarning) AlertDialog(
+        onDismissRequest = { },
+        title = { uk.hamdigital.ui.Text("密码未保存") },
+        text = { uk.hamdigital.ui.Text("本次已经登录，但系统密钥库无法安全保存密码，下一次启动将需要重新输入。可以继续本次控制，或断开后检查设备安全设置。") },
+        confirmButton = {
+            TextButton({
+                profileSaveWarning = false
+                proceedWithoutSavedProfile = true
+            }) { uk.hamdigital.ui.Text("仅本次继续") }
+        },
+        dismissButton = {
+            TextButton({
+                profileSaveWarning = false
+                suppressAutoNavigation = true
+                busy = false
+                pendingProfile = null
+                pendingGeneration = 0L
+                pendingSavedGeneration = 0L
+                IcomNet.disconnect()
+            }) { uk.hamdigital.ui.Text("断开连接", color = Pal.Red) }
+        },
+    )
 
     Column(
         Modifier.fillMaxSize()
@@ -188,7 +261,7 @@ fun ConnectScreen(vm: MainViewModel) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 uk.hamdigital.ui.Text("ARCH-705", color = Pal.Text, fontFamily = OrbitronFamily, fontWeight = FontWeight.Bold, fontSize = 25.sp, letterSpacing = (-0.4).sp, maxLines = 1, softWrap = false, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                uk.hamdigital.ui.Text("IC-705 DIRECT CONSOLE", color = Pal.Cyan, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.2.sp)
+                uk.hamdigital.ui.Text("IC-705 直连控制台", color = Pal.Cyan, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.2.sp)
             }
             ArchNavAction("设置") { vm.show(Screen.SettingsPage) }
         }

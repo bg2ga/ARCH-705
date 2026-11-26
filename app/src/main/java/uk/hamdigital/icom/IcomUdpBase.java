@@ -6,6 +6,7 @@ package uk.hamdigital.icom;
  * @date 2023-03-20
  */
 
+import android.net.Network;
 import android.util.Log;
 
 
@@ -15,6 +16,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.SocketException;
 import java.net.UnknownHostException;
+import java.security.SecureRandom;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -64,7 +66,8 @@ public class IcomUdpBase {
     public int rigPort;
     public String rigIp;
     public int localPort;
-    public int localId = (int) System.currentTimeMillis();//随机码，以时间为随机变量
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    public int localId = SECURE_RANDOM.nextInt();
     public int remoteId;
     public boolean authDone = false;//登录
     public boolean rigReadyDone = false;//电台已经ready,control可以执行登录，ci-v可以执行open.
@@ -73,7 +76,7 @@ public class IcomUdpBase {
     public short innerSeq = 0x30;
     public synchronized short nextInnerSeq() { short value = innerSeq; innerSeq++; return value; }
     public int rigToken;//电台提供的令牌
-    public short localToken = (short) System.currentTimeMillis();//本地生成的令牌，可以是随机数
+    public short localToken = (short) SECURE_RANDOM.nextInt();
     public volatile boolean isPttOn = false;
 
 
@@ -83,7 +86,8 @@ public class IcomUdpBase {
     public long lastSentTime = System.currentTimeMillis();//最后收到数据的时间
 
 
-    public IcomUdpClient udpClient;//用于与电台通讯的udp
+    public IcomUdpClient udpClient;
+    protected Network preferredNetwork;
 
 
     public OnStreamEvents onStreamEvents;//一些事件处理
@@ -99,8 +103,11 @@ public class IcomUdpBase {
         sendUntrackedPacket(IComPacketTypes.ControlPacket.toBytes(IComPacketTypes.CMD_DISCONNECT
                 , (short) 0, localId, remoteId));
         stopTimer(areYouThereTimer);
+        areYouThereTimer = null;
         stopTimer(pingTimer);
+        pingTimer = null;
         stopTimer(idleTimer);
+        idleTimer = null;
         closeStream();
     }
 
@@ -116,9 +123,11 @@ public class IcomUdpBase {
     /**
      * 打开Udp流端口，如果Udp端口已经打开了，会再打开一次，本地端口应该会变化
      */
-    public synchronized void openStream() {//打开
+    public synchronized void setPreferredNetwork(Network network) { preferredNetwork = network; }
+
+    public synchronized void openStream() {
         if (udpClient != null) closeStream();
-        udpClient = new IcomUdpClient(-1);
+        udpClient = new IcomUdpClient(-1, preferredNetwork);
         udpClient.setOnUdpEvents(new IcomUdpClient.OnUdpEvents() {
             @Override
             public void OnReceiveData(DatagramSocket socket, DatagramPacket packet, byte[] data) {
@@ -143,8 +152,10 @@ public class IcomUdpBase {
             localPort = udpClient.getLocalPort();
             Log.d(TAG, "IcomUdpBase: Open udp local port:" + localPort);
         } catch (SocketException e) {
-            e.printStackTrace();
             Log.e(TAG, "IcomUdpBase: Open udp failed:" + e.getMessage());
+            IcomUdpClient failed = udpClient;
+            udpClient = null;
+            if (failed != null) failed.close();
         }
     }
 
@@ -275,7 +286,7 @@ public class IcomUdpBase {
     public void startAreYouThereTimer() {
         Log.e(TAG, "startAreYouThereTimer: stop timer:" + this.toString());
         stopTimer(areYouThereTimer);
-
+        areYouThereTimer = null;
         areYouThereTimer = new Timer();
 
         areYouThereTimer.scheduleAtFixedRate(new AreYouThereTimerTask()
@@ -287,6 +298,7 @@ public class IcomUdpBase {
      */
     public void startPingTimer() {
         stopTimer(pingTimer);//如果之前有打开的时钟，就关闭
+        pingTimer = null;
         Log.d(TAG, String.format("start PingTimer: local port:%d,remote port %d", localPort, rigPort));
         pingTimer = new Timer();
         pingTimer.scheduleAtFixedRate(new PingTimerTask(), 0, IComPacketTypes.PING_PERIOD_MS);
@@ -297,6 +309,7 @@ public class IcomUdpBase {
      */
     public void startIdleTimer() {
         stopTimer(idleTimer);
+        idleTimer = null;
         Log.d(TAG, String.format("start Idle Timer: local port:%d,remote port %d", localPort, rigPort));
         idleTimer = new Timer();
         idleTimer.scheduleAtFixedRate(new IdleTimerTask(), IComPacketTypes.IDLE_PERIOD_MS
@@ -312,7 +325,6 @@ public class IcomUdpBase {
         if (timer != null) {
             timer.cancel();
             timer.purge();
-            timer = null;
         }
     }
 

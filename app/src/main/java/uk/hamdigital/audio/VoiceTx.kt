@@ -21,7 +21,10 @@ object VoiceTx {
     private var session = 0L
 
     fun start(ctx: Context, settings: Settings): Boolean = synchronized(lock) {
-        if (active.value) return true
+        if (active.value) {
+            lastError.value = "已有发射任务"
+            return false
+        }
         lastError.value = ""
         Transmitter.blocked(ctx, settings.callsign)?.let { why ->
             lastError.value = why
@@ -49,7 +52,7 @@ object VoiceTx {
             lastError.value = "无法启动麦克风：" + (e.message ?: "未知错误")
             return false
         }
-        if (!Transmitter.startStream(ctx, settings.callsign, 12000, "VOICE")) {
+        if (!Transmitter.startStream(ctx, settings.callsign, 12000, "VOICE", mySession) || !Transmitter.streaming) {
             runCatching { input.stop() }
             input.release()
             lastError.value = Transmitter.lastError.value.ifBlank { "PTT 启动失败" }
@@ -68,7 +71,7 @@ object VoiceTx {
             } catch (e: Exception) {
                 if (active.value && session == mySession) {
                     lastError.value = "麦克风中断，已停止发射：" + (e.message ?: "未知错误")
-                    stopSession(mySession)
+                    stopSession(mySession, releaseTransmitter = true)
                 }
             }
         }, "arch705-voice-tx").also { it.start() }
@@ -77,25 +80,45 @@ object VoiceTx {
 
     fun stop() {
         val current = synchronized(lock) { session }
-        stopSession(current)
+        stopSession(current, releaseTransmitter = true)
     }
 
-    private fun stopSession(expected: Long) {
+    internal fun currentSession(): Long = synchronized(lock) { session }
+
+    internal fun release(expected: Long) {
+        if (expected <= 0L) stop() else stopSession(expected, releaseTransmitter = true)
+    }
+
+    internal fun cancelCapture(expected: Long = -1L) {
+        if (expected <= 0L) return
+        stopSession(expected, releaseTransmitter = false)
+    }
+
+    private fun stopSession(expected: Long, releaseTransmitter: Boolean) {
         val input: AudioRecord?
         val oldThread: Thread?
+        var wasStreaming = false
+        var stoppedSession = 0L
         synchronized(lock) {
             if (session != expected) return
             active.value = false
             session++
+            stoppedSession = session
             input = recorder
             recorder = null
             oldThread = thread
             thread = null
             oldThread?.interrupt()
-            if (Transmitter.streaming) Transmitter.stopStream() else Ic705.ptt(false)
+            wasStreaming = Transmitter.streaming
         }
         runCatching { input?.stop() }
         runCatching { input?.release() }
+        if (releaseTransmitter) {
+            if (wasStreaming) Transmitter.stopStream("VOICE", expected)
+            else if (synchronized(lock) { session == stoppedSession }) {
+                if (Ic705.net) uk.hamdigital.rig.IcomNet.forceUnkey() else Ic705.ptt(false)
+            }
+        }
         if (oldThread !== Thread.currentThread()) runCatching { oldThread?.join(300) }
     }
 }

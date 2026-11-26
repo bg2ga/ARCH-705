@@ -1,6 +1,7 @@
 package uk.hamdigital
 
 import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -94,8 +95,10 @@ class ArchFloatingPttService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
 
     override fun onInterrupt() {
+        overlay?.cancelPendingStart()
         emergencyStop()
         overlay?.setActive(false)
+        hideOverlay()
     }
 
     private fun collectSettings() {
@@ -162,7 +165,12 @@ class ArchFloatingPttService : AccessibilityService() {
         view.setLocked(PttLock.locked.value)
         view.setActive(Transmitter.on.value)
         view.setConnected(Ic705.state.value.link == RigState.Link.CONNECTED)
-        runCatching { wm.addView(view, lp) }
+        val added = runCatching { wm.addView(view, lp) }
+        if (added.isFailure) {
+            toast("悬浮 PTT 无法显示，请确认无障碍服务仍已启用")
+            hideOverlay()
+            return
+        }
         overlay = view
     }
 
@@ -196,6 +204,7 @@ class ArchFloatingPttService : AccessibilityService() {
     }
 }
 
+@SuppressLint("ViewConstructor")
 internal class ArchPttOverlayView(
     context: Context,
     private val wm: WindowManager,
@@ -221,6 +230,7 @@ internal class ArchPttOverlayView(
     private var moved = false
     private var lockPress = false
     private var pttStarted = false
+    private var activePointerId = MotionEvent.INVALID_POINTER_ID
     private val slop = dp(9f)
     private val startRunnable = Runnable {
         if (!moved && !lockPress && !locked && !pttStarted) {
@@ -241,6 +251,12 @@ internal class ArchPttOverlayView(
     init {
         setLayerType(LAYER_TYPE_SOFTWARE, null)
         elevation = dp(8f)
+        contentDescription = "ARCH-705 悬浮 PTT"
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 
     fun attach(layoutParams: WindowManager.LayoutParams) { params = layoutParams }
@@ -308,7 +324,8 @@ internal class ArchPttOverlayView(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                downRawX = event.rawX; downRawY = event.rawY
+                activePointerId = event.getPointerId(0)
+                downRawX = event.x; downRawY = event.y
                 startX = params?.x ?: 0; startY = params?.y ?: 0
                 moved = false
                 pttStarted = false
@@ -317,8 +334,10 @@ internal class ArchPttOverlayView(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = event.rawX - downRawX
-                val dy = event.rawY - downRawY
+                val pointerIndex = event.findPointerIndex(activePointerId)
+                if (pointerIndex < 0) return true
+                val dx = event.getX(pointerIndex) - downRawX
+                val dy = event.getY(pointerIndex) - downRawY
                 if (!moved && (abs(dx) > slop || abs(dy) > slop)) {
                     moved = true
                     handler.removeCallbacks(startRunnable)
@@ -338,10 +357,22 @@ internal class ArchPttOverlayView(
                 }
                 return true
             }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.getPointerId(event.actionIndex) == activePointerId) {
+                    handler.removeCallbacks(startRunnable)
+                    if (pttStarted || active) onPttStop()
+                    pttStarted = false
+                    activePointerId = MotionEvent.INVALID_POINTER_ID
+                    invalidate()
+                }
+                return true
+            }
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(startRunnable)
                 if (pttStarted || active) onPttStop()
                 pttStarted = false
+                activePointerId = MotionEvent.INVALID_POINTER_ID
+                if (!moved) performClick()
                 if (!moved && lockPress) onToggleLock()
                 if (moved) params?.let { p ->
                     context.getSharedPreferences("floating_ptt_overlay", Context.MODE_PRIVATE).edit().putInt("x", p.x).putInt("y", p.y).apply()
@@ -353,6 +384,7 @@ internal class ArchPttOverlayView(
                 handler.removeCallbacks(startRunnable)
                 if (pttStarted || active) onPttStop()
                 pttStarted = false
+                activePointerId = MotionEvent.INVALID_POINTER_ID
                 invalidate()
                 return true
             }

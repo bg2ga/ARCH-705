@@ -18,7 +18,13 @@ public class IcomAudioUdp extends AudioUdp {
     private static final String TAG = "IcomAudioUdp";
 
 
-    private final ExecutorService doTXThreadPool = Executors.newSingleThreadExecutor();
+    private volatile boolean oneShotAudioActive;
+    private volatile long oneShotAudioPackets;
+    private final ExecutorService doTXThreadPool = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "icom-audio-tx-one-shot");
+        thread.setDaemon(true);
+        return thread;
+    });
 
 
     @Override
@@ -37,8 +43,14 @@ public class IcomAudioUdp extends AudioUdp {
                 x = -1.0f;
             temp[i] = (short)  (x * 32767.0);
         }
-        doTXThreadPool.execute(new DoTXAudioRunnable(this, temp));
+        oneShotAudioPackets = 0;
+        oneShotAudioActive = true;
+        try { doTXThreadPool.execute(new DoTXAudioRunnable(this, temp)); }
+        catch (RuntimeException error) { oneShotAudioActive = false; throw error; }
     }
+
+    public boolean isOneShotActive() { return oneShotAudioActive; }
+    public long oneShotPacketCount() { return oneShotAudioPackets; }
     private static class DoTXAudioRunnable implements Runnable{
         IcomAudioUdp icomAudioUdp;
         final short[] audioData;
@@ -50,8 +62,8 @@ public class IcomAudioUdp extends AudioUdp {
 
         @Override
         public void run() {
-            if (audioData==null) return;
-
+            if (audioData==null) { icomAudioUdp.oneShotAudioActive = false; return; }
+            try {
             final int partialLen = IComPacketTypes.TX_BUFFER_SIZE * 2;//数据包的长度
             //要转换一下到BYTE,小端模式
 
@@ -64,6 +76,7 @@ public class IcomAudioUdp extends AudioUdp {
 
                 icomAudioUdp.sendTrackedPacket(IComPacketTypes.AudioPacket.getTxAudioPacket(audioPacket
                         , (short) 0, icomAudioUdp.localId, icomAudioUdp.remoteId, icomAudioUdp.nextInnerSeq()));
+                icomAudioUdp.oneShotAudioPackets++;
 
                 Arrays.fill(audioPacket,(byte)0x00);
                 if (i>=3) {//让前两个空数据发送出去
@@ -83,7 +96,9 @@ public class IcomAudioUdp extends AudioUdp {
                 }
             }
             Log.d(TAG, "run: 音频发送完毕！！" );
-            Thread.currentThread().interrupt();
+            } finally {
+                icomAudioUdp.oneShotAudioActive = false;
+            }
         }
 
     }
@@ -93,9 +108,12 @@ public class IcomAudioUdp extends AudioUdp {
     // sendTxAudioData above sends one finished recording (padded with silence, on its own thread); live speech needs a
     // stream instead: pushTxAudio queues 12 kHz samples as they are made, and the stream thread sends a packet of
     // TX_BUFFER_SIZE samples (20 ms) every 20 ms while PTT is on - silence if the queue has run dry.
-    private final short[] txFifo = new short[12000 * 2];   // 2 s of queue
-    private int txHead = 0, txCount = 0;                   // where the oldest sample is, how many are queued
-    private volatile boolean streaming = false;            // the stream thread runs
+    private final short[] txFifo = new short[12000 * 2];
+    private int txHead = 0, txCount = 0;
+    private final java.util.concurrent.atomic.AtomicBoolean streaming = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile Thread streamThread;
+    private volatile long streamPackets;
+    private final java.util.concurrent.atomic.AtomicLong streamGeneration = new java.util.concurrent.atomic.AtomicLong();
 
     /** Queue 12 kHz transmit samples (the oldest are dropped if the queue is full). */
     public synchronized void pushTxAudio(short[] s, int n) {
@@ -111,34 +129,70 @@ public class IcomAudioUdp extends AudioUdp {
         }
     }
 
-    /** Start sending the queue (PTT must be on): a packet every 20 ms until stopTxStream or PTT off. */
-    public void startTxStream() {
-        if (streaming) return; streaming = true;
-        synchronized (this) { txHead = 0; txCount = 0; }
-        new Thread(() -> {
+    public synchronized boolean startTxStream() {
+        if (streaming.get()) return false;
+        txHead = 0; txCount = 0; streamPackets = 0;
+        final long generation = streamGeneration.incrementAndGet();
+        streaming.set(true);
+        Thread worker = new Thread(() -> {
             short[] samples = new short[IComPacketTypes.TX_BUFFER_SIZE];
             byte[] audioPacket = new byte[IComPacketTypes.TX_BUFFER_SIZE * 2];
             long next = System.currentTimeMillis();
-            while (streaming && isPttOn) {
-                pullTxAudio(samples);
-                for (int j = 0; j < samples.length; j++) System.arraycopy(IComPacketTypes.shortToBigEndian(samples[j]), 0, audioPacket, j * 2, 2); // (as sendTxAudioData packs them)
-                sendTrackedPacket(IComPacketTypes.AudioPacket.getTxAudioPacket(audioPacket, (short) 0, localId, remoteId, nextInnerSeq()));
-                next += 20;                                // 20 ms a packet, paced to the clock (no drift)
-                long wait = next - System.currentTimeMillis();
-                if (wait > 0) try { Thread.sleep(wait); } catch (InterruptedException e) { break; }
+            try {
+                while (streaming.get() && streamGeneration.get() == generation) {
+                    pullTxAudio(samples);
+                    for (int j = 0; j < samples.length; j++) System.arraycopy(IComPacketTypes.shortToBigEndian(samples[j]), 0, audioPacket, j * 2, 2);
+                    sendTrackedPacket(IComPacketTypes.AudioPacket.getTxAudioPacket(audioPacket, (short) 0, localId, remoteId, nextInnerSeq()));
+                    streamPackets++;
+                    next += 20;
+                    long wait = next - System.currentTimeMillis();
+                    if (wait > 0) try { Thread.sleep(wait); } catch (InterruptedException e) { break; }
+                }
+            } catch (Throwable error) {
+                Log.e(TAG, "TX audio stream failed", error);
+            } finally {
+                if (streamGeneration.get() == generation) {
+                    streaming.set(false);
+                    synchronized (this) { txCount = 0; }
+                }
+                if (streamThread == Thread.currentThread()) streamThread = null;
             }
-            streaming = false;
-        }, "icom-tx-stream").start();
+        }, "icom-tx-stream");
+        streamThread = worker;
+        try {
+            worker.start();
+            return worker.isAlive();
+        } catch (Throwable error) {
+            streaming.set(false);
+            streamThread = null;
+            return false;
+        }
     }
 
-    /** Samples queued, not yet sent (the app waits for none before it stops: the end of an over is not cut off). */
+    public boolean isTxStreaming() { return streaming.get(); }
+    public long txStreamPackets() { return streamPackets; }
     public synchronized int txQueued() { return txCount; }
 
-    /** Stop sending the queue (and forget what is left in it). */
-    public void stopTxStream() { streaming = false; synchronized (this) { txCount = 0; } }
+    public void stopTxStream() {
+        streaming.set(false);
+        streamGeneration.incrementAndGet();
+        Thread worker = streamThread;
+        if (worker != null) worker.interrupt();
+        if (worker != null && worker != Thread.currentThread()) {
+            try { worker.join(80); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+        }
+        synchronized (this) { txCount = 0; }
+    }
 
     @Override
     public void stopTXAudio() { stopTxStream(); isPttOn = false; }
+
+    @Override
+    public void close() {
+        stopTXAudio();
+        doTXThreadPool.shutdownNow();
+        super.close();
+    }
 
     @Override
     public void onDataReceived(DatagramPacket packet, byte[] data) {

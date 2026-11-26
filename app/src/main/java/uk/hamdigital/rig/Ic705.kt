@@ -84,7 +84,6 @@ data class RigState(
     val monitor: Int = -1,                            // TX monitor 0/1
     val monitorGain: Int = -1,                        // monitor gain 0..255
     val compressorLevel: Int = -1,                    // compressor level 0..255
-    val digitalVoice: DigitalVoiceInfo? = null,        // ARCH-705 A7DV v3 read-only extension frame
 ) {
     enum class Link { NONE, ASKING, CONNECTED }       // not connected / waiting for USB permission / talking to it
     /** "14.074.000" */
@@ -284,8 +283,7 @@ object Ic705 {
                 0x15 -> { val raw = bcd2Msb(d, 1); android.util.Log.d("Ic705Meter", "Vd bytes=${d.drop(1)} raw=$raw"); set { it.copy(vdMeter = raw) } }
                 0x16 -> { val raw = bcd2Msb(d, 1); android.util.Log.d("Ic705Meter", "Id bytes=${d.drop(1)} raw=$raw"); set { it.copy(idMeter = raw) } }
             }
-            0xF0 -> if (d.size >= 2 && d[0] == 0x01) DigitalVoiceDecoder.parseFrame(listOf(0xf0) + d)?.let { info -> set { it.copy(digitalVoice = info) } }
-            0x0D -> if (d.size >= 3) set { it.copy(offsetHz = bcdToHz(d)) }
+            0x0D -> if (d.size >= 3) set { it.copy(offsetHz = Ic705Codec.offsetValue(d)) }
             0x0F -> if (d.isNotEmpty()) set { it.copy(split = d[0]) }
             0x1B -> if (d.isNotEmpty()) when (d[0]) {
                 0x00 -> if (d.size >= 3) set { it.copy(toneTenths = toneTenths(d)) }
@@ -304,7 +302,6 @@ object Ic705 {
                         else it.copy(data = dataOn, dataB = dataOn)
                     }
                 }
-                0x04 -> DigitalVoiceDecoder.parseFrame(listOf(0x1a) + d)?.let { info -> set { it.copy(digitalVoice = info) } }
                 0x05 -> if (d.size >= 4 && d[1] == 0x01 && d[2] == 0x15) set { it.copy(wlanAfSql = d[3]) }
             }
             0x25 -> if (d.size >= 6) {
@@ -541,7 +538,8 @@ object Ic705 {
     }
 
     /** CI-V applies mode and DATA to the selected VFO, so select the target first and leave enough time for the radio to switch. */
-    fun setChannelModeForVfo(vfo: Int, mode: Int, data: Boolean, filter: Int = 1) {
+    fun setChannelModeForVfo(vfo: Int, mode: Int, data: Boolean, filter: Int = 1): Boolean {
+        if (state.value.vfoSwitching) return false
         val target = vfo.coerceIn(0, 1)
         beginVfoTransaction()
         channelModeExecutor.execute {
@@ -563,6 +561,7 @@ object Ic705 {
                 endVfoTransaction()
             }
         }
+        return true
     }
     /** CI-V 18: 0 powers the radio off, 1 turns it on when the LAN control link is available. */
     fun setPowerState(on: Boolean) {
@@ -743,9 +742,9 @@ object Ic705 {
         if (setFrequency(hz)) setMode(m)
     }
 
-    /** Key / unkey the transmitter (over WiFi this also opens the transmit audio stream). */
-    fun ptt(on: Boolean) {
-        if (on && PttLock.locked.value) return
+    /** Key / unkey the transmitter; false means the command was not sent. */
+    fun ptt(on: Boolean): Boolean {
+        if (on && (PttLock.locked.value || state.value.link != RigState.Link.CONNECTED)) return false
         if (on) {
             pttReleaseAtMs = 0L
             set { it.copy(txRequested = true, pttOffConfirmations = 0) }
@@ -753,8 +752,14 @@ object Ic705 {
             pttReleaseAtMs = System.currentTimeMillis()
             set { it.copy(pttOffConfirmations = 0) }
         }
-        if (net) IcomNet.ptt(on) else send(0x1C, 0x00, if (on) 0x01 else 0x00)
+        if (net) {
+            if (!IcomNet.ptt(on)) {
+                if (on) set { it.copy(txRequested = false) }
+                return false
+            }
+        } else send(0x1C, 0x00, if (on) 0x01 else 0x00)
         send(0x1C, 0x00)
+        return true
     }
 
     fun pttReleaseSent() {

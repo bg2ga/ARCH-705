@@ -25,7 +25,6 @@ data class Settings(
     val callsign: String = "",
     val locator: String = "",
     val audio: AudioChoice = AudioChoice.WIFI,
-    val showSplash: Boolean = true,
     val civAddr: Int = 0xA4,
     val txLevel: Int = 30,
     val txOk: Boolean = false,
@@ -51,8 +50,7 @@ class SettingsStore(private val ctx: Context) {
     private val kCall = stringPreferencesKey("callsign")
     private val kLoc = stringPreferencesKey("locator")
     private val kAudio = stringPreferencesKey("audio")
-    private val kSplash = booleanPreferencesKey("show_splash")
-    private val kCiv = intPreferencesKey("civ_address")
+        private val kCiv = intPreferencesKey("civ_address")
     private val kTxLevel = intPreferencesKey("tx_level")
     private val kTxOk = booleanPreferencesKey("tx_ok")
     private val kWIp = stringPreferencesKey("wifi_ip")
@@ -78,7 +76,6 @@ class SettingsStore(private val ctx: Context) {
         callsign = this[kCall] ?: "",
         locator = this[kLoc] ?: "",
         audio = AudioChoice.entries.firstOrNull { it.name == this[kAudio] } ?: AudioChoice.WIFI,
-        showSplash = this[kSplash] ?: true,
         civAddr = this[kCiv] ?: 0xA4,
         txLevel = this[kTxLevel] ?: 30,
         txOk = this[kTxOk] ?: false,
@@ -106,7 +103,6 @@ class SettingsStore(private val ctx: Context) {
             if (it.length >= 4) it.take(2).uppercase() + it.drop(2).take(2) + it.drop(4).lowercase() else it.uppercase()
         }
         this[kAudio] = s.audio.name
-        this[kSplash] = s.showSplash
         this[kCiv] = s.civAddr
         this[kTxLevel] = s.txLevel
         this[kTxOk] = s.txOk

@@ -1,6 +1,6 @@
 import java.util.Properties                          // keystore.properties reader
 
-// The app module: Kotlin + Jetpack Compose UI, and the native decoders (open-source C/C++) built with the NDK (src/main/cpp).
+// ARCH-705 standard direct-control app: Kotlin + Jetpack Compose.
 plugins {
     alias(libs.plugins.android.application)          // Android app
     alias(libs.plugins.kotlin.compose)               // Compose compiler
@@ -25,15 +25,13 @@ if (buildingRelease && signing.getProperty("storeFile") == null) {
 android {
     namespace = "uk.hamdigital"                      // Kotlin package / R class
     compileSdk = 37                                  // Android 17 APIs (the current Compose libraries need them)
-    ndkVersion = "30.0.16248370"                     // NDK from the SDK Manager
 
     defaultConfig {
         applicationId = "cn.arch.ic705remote"              // installed app id
         minSdk = 26                                  // Android 8.0 and newer
         targetSdk = 35                               // Android 15 behaviour
-        versionCode = 30
-        versionName = "2.3.9"
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") } // phones and tablets (ARM); x86_64 (the emulator, a few old Intel tablets) left out from 0.12.0: 28 MB smaller - add it back here to run in the emulator
+        versionCode = 37
+        versionName = "2.5.0"
     }
 
     signingConfigs {
@@ -51,7 +49,8 @@ android {
         }
         release {
             signingConfigs.findByName("release")?.let { signingConfig = it } // signed with the release key when it is set up
-            isMinifyEnabled = false                  // no shrinking (keeps JNI names simple)
+            isMinifyEnabled = true
+            isShrinkResources = true
         }
     }
     compileOptions {
@@ -59,12 +58,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     buildFeatures { compose = true; buildConfig = true } // Jetpack Compose; BuildConfig (VERSION_NAME for the startup screen and Guide)
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt") // the decoders
-            version = "4.1.2"                        // CMake from the SDK Manager
-        }
-    }
 }
 
 dependencies {

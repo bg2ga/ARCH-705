@@ -49,8 +49,7 @@ public class IcomCivUdp extends IcomUdpBase{
                 checkCivData(data);
             }
             if (IComPacketTypes.ControlPacket.getType(data) == IComPacketTypes.CMD_RETRANSMIT) {
-                Log.d(TAG, "onDataReceived: type=0x01"+IComPacketTypes.byteToStr(data) );
-                //lastReceived=System.currentTimeMillis();//更新一下最后接收数据的时间，让watchDog处理
+                // Retransmission requests are expected on lossy links.
             }
 
         }

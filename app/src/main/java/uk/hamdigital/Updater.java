@@ -25,6 +25,9 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Locale;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Secure OTA updater for IC-705 Remote. */
 public final class Updater {
@@ -34,10 +37,17 @@ public final class Updater {
     private static final String ALLOWED_APK_PREFIX = "https://hljrsa.cn:50113/releases/apps/ic705-remote/";
     private static final String PREFS = "ic705_updater";
     private static final String KEY_PENDING_APK = "pending_apk";
+    private static final String KEY_PENDING_SHA = "pending_sha256";
+    private static final String KEY_PENDING_SIZE = "pending_size";
+    private static final String KEY_PENDING_CODE = "pending_version_code";
+    private static final String KEY_PENDING_NAME = "pending_version_name";
     private static final String USER_AGENT = "IC705Remote-Android/" + BuildConfig.VERSION_NAME;
     private static final long MAX_MANIFEST_BYTES = 256L * 1024L;
     private static final long MAX_APK_BYTES = 250L * 1024L * 1024L;
     private static boolean autoChecked;
+    private static final AtomicBoolean checking = new AtomicBoolean(false);
+    private static final AtomicBoolean downloading = new AtomicBoolean(false);
+    private static final AtomicBoolean resuming = new AtomicBoolean(false);
 
     private final Activity activity;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -46,11 +56,15 @@ public final class Updater {
 
     public void check(boolean silent, StatusListener listener) {
         if (silent && autoChecked) return;
-        if (silent) autoChecked = true;
+        if (!checking.compareAndSet(false, true)) {
+            report(listener, "正在检查更新…");
+            return;
+        }
         report(listener, "正在检查更新…");
         new Thread(() -> {
             try {
                 JSONObject manifest = fetchManifest();
+                if (silent) autoChecked = true;
                 ui.post(() -> processManifest(manifest, silent, listener));
             } catch (Exception error) {
                 android.util.Log.e("IC705-UPDATE", "update check failed", error);
@@ -58,18 +72,48 @@ public final class Updater {
                     report(listener, "检查更新失败");
                     if (!silent) showInfo("检查更新失败", safeMessage(error));
                 });
+            } finally {
+                checking.set(false);
             }
         }, "ic705-update-check").start();
     }
 
-    public void resumePendingInstall() {
-        if (Build.VERSION.SDK_INT >= 26 && !activity.getPackageManager().canRequestPackageInstalls()) return;
+    public boolean resumePendingInstall() {
+        if (Build.VERSION.SDK_INT >= 26 && !activity.getPackageManager().canRequestPackageInstalls()) return false;
         SharedPreferences preferences = activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE);
         String path = preferences.getString(KEY_PENDING_APK, "");
-        if (path == null || path.isEmpty()) return;
+        if (path == null || path.isEmpty()) return false;
         File apk = new File(path);
-        preferences.edit().remove(KEY_PENDING_APK).apply();
-        if (apk.isFile()) install(apk);
+        String sha = preferences.getString(KEY_PENDING_SHA, "");
+        long size = preferences.getLong(KEY_PENDING_SIZE, -1L);
+        int code = preferences.getInt(KEY_PENDING_CODE, -1);
+        String name = preferences.getString(KEY_PENDING_NAME, "");
+        if (name == null || name.isEmpty()) {
+            preferences.edit().clear().apply();
+            if (apk.isFile()) apk.delete();
+            return false;
+        }
+        if (!resuming.compareAndSet(false, true)) return true;
+        new Thread(() -> {
+            try {
+                if (!apk.isFile() || size <= 0 || apk.length() != size || sha == null || !sha.matches("[0-9a-fA-F]{64}"))
+                    throw new SecurityException("待安装更新文件已损坏");
+                if (!toHex(sha256(apk)).equalsIgnoreCase(sha)) throw new SecurityException("待安装更新文件校验失败");
+                verifyPackage(apk, code, name);
+                ui.post(() -> {
+                    resuming.set(false);
+                    install(apk);
+                });
+            } catch (Exception error) {
+                preferences.edit().clear().apply();
+                if (apk.isFile()) apk.delete();
+                ui.post(() -> {
+                    resuming.set(false);
+                    showInfo("更新文件校验失败", safeMessage(error));
+                });
+            }
+        }, "ic705-update-resume").start();
+        return true;
     }
 
     private JSONObject fetchManifest() throws Exception {
@@ -106,7 +150,7 @@ public final class Updater {
         String apkUrl = manifest.getString("apkUrl").trim();
         String sha256 = manifest.getString("sha256").trim();
         long size = manifest.getLong("size");
-        if (versionCode <= 0 || versionName.isEmpty() || size <= 0 || size > MAX_APK_BYTES
+        if (versionCode <= 0 || versionName.isEmpty() || versionName.length() > 32 || size <= 0 || size > MAX_APK_BYTES
                 || !sha256.matches("[0-9a-fA-F]{64}") || !isAllowedApkUrl(apkUrl)) {
             throw new SecurityException("更新清单字段无效");
         }
@@ -116,6 +160,7 @@ public final class Updater {
     }
 
     private void processManifest(JSONObject manifest, boolean silent, StatusListener listener) {
+        if (activity.isFinishing() || (Build.VERSION.SDK_INT >= 17 && activity.isDestroyed())) return;
         try {
             int remoteCode = manifest.getInt("versionCode");
             String remoteName = manifest.getString("versionName");
@@ -135,7 +180,7 @@ public final class Updater {
                     .setMessage(notes + "\n\n版本代码：" + remoteCode + "\n安装包：" + formatBytes(size) +
                             "\n\n安装前将校验 SHA-256、包名、版本和签名。")
                     .setPositiveButton("下载并更新", (dialog, which) ->
-                            download(apkUrl, sha256, size, remoteCode, listener))
+                            download(apkUrl, sha256, size, remoteCode, remoteName, listener))
                     .setNegativeButton("稍后", null)
                     .show();
         } catch (Exception error) {
@@ -145,7 +190,11 @@ public final class Updater {
     }
 
     private void download(String apkUrl, String expectedSha, long expectedSize,
-                          int expectedVersionCode, StatusListener listener) {
+                          int expectedVersionCode, String expectedVersionName, StatusListener listener) {
+        if (!downloading.compareAndSet(false, true)) {
+            showInfo("正在下载", "更新安装包正在下载，请稍候。");
+            return;
+        }
         report(listener, "正在下载更新…");
         new Thread(() -> {
             File target = new File(activity.getCacheDir(), ApkProvider.UPDATE_FILE);
@@ -178,24 +227,33 @@ public final class Updater {
                         if (!toHex(digest.digest()).equalsIgnoreCase(expectedSha)) throw new SecurityException("SHA-256 校验失败");
                     }
                 } finally { connection.disconnect(); }
-                verifyPackage(temp, expectedVersionCode);
+                verifyPackage(temp, expectedVersionCode, expectedVersionName);
                 if (target.exists() && !target.delete()) throw new IllegalStateException("无法替换更新文件");
                 if (!temp.renameTo(target)) throw new IllegalStateException("无法保存更新文件");
+                activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE).edit()
+                        .putString(KEY_PENDING_SHA, expectedSha.toLowerCase(Locale.ROOT))
+                        .putLong(KEY_PENDING_SIZE, expectedSize)
+                        .putInt(KEY_PENDING_CODE, expectedVersionCode)
+                        .putString(KEY_PENDING_NAME, expectedVersionName)
+                        .apply();
                 ui.post(() -> { report(listener, "下载与校验完成"); install(target); });
             } catch (Exception error) {
                 if (temp.exists()) temp.delete();
                 android.util.Log.e("IC705-UPDATE", "download failed", error);
                 ui.post(() -> { report(listener, "下载失败"); showInfo("更新失败", safeMessage(error)); });
+            } finally {
+                downloading.set(false);
             }
         }, "ic705-update-download").start();
     }
 
-    private void verifyPackage(File apk, int expectedVersionCode) throws Exception {
+    private void verifyPackage(File apk, int expectedVersionCode, String expectedVersionName) throws Exception {
         PackageManager manager = activity.getPackageManager();
         int flags = Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
         PackageInfo candidate = manager.getPackageArchiveInfo(apk.getAbsolutePath(), flags);
         if (candidate == null || !activity.getPackageName().equals(candidate.packageName)
-                || candidate.versionCode != expectedVersionCode || candidate.versionCode <= BuildConfig.VERSION_CODE) {
+                || candidate.versionCode != expectedVersionCode || candidate.versionCode <= BuildConfig.VERSION_CODE
+                || expectedVersionName == null || !expectedVersionName.equals(candidate.versionName)) {
             throw new SecurityException("更新包包名或版本不匹配");
         }
         if (!signatureDigest(candidate, flags).equals(signatureDigest(
@@ -210,13 +268,27 @@ public final class Updater {
         if (Build.VERSION.SDK_INT >= 28) {
             SigningInfo signingInfo = info.signingInfo;
             if (signingInfo == null) throw new SecurityException("无法读取文件签名");
-            signatures = signingInfo.hasMultipleSigners() ? signingInfo.getApkContentsSigners() : signingInfo.getSigningCertificateHistory();
+            signatures = signingInfo.getApkContentsSigners();
         } else signatures = info.signatures;
         if (signatures == null || signatures.length == 0) throw new SecurityException("文件没有签名");
-        return toHex(MessageDigest.getInstance("SHA-256").digest(signatures[0].toByteArray()));
+        Set<String> digests = new TreeSet<>();
+        for (Signature signature : signatures)
+            digests.add(toHex(MessageDigest.getInstance("SHA-256").digest(signature.toByteArray())));
+        return String.join(",", digests);
+    }
+
+    private byte[] sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = java.nio.file.Files.newInputStream(file.toPath())) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) > 0) digest.update(buffer, 0, count);
+        }
+        return digest.digest();
     }
 
     private void install(File apk) {
+        if (activity.isFinishing() || (Build.VERSION.SDK_INT >= 17 && activity.isDestroyed())) return;
         if (Build.VERSION.SDK_INT >= 26 && !activity.getPackageManager().canRequestPackageInstalls()) {
             activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE).edit().putString(KEY_PENDING_APK, apk.getAbsolutePath()).apply();
             showInfo("需要安装权限", "请允许“ARCH-705”安装未知应用，返回后会继续安装。", "打开设置", () -> {
@@ -229,12 +301,28 @@ public final class Updater {
         Intent intent = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         intent.setClipData(android.content.ClipData.newRawUri("", uri));
-        try { activity.startActivity(intent); }
-        catch (Exception error) { showInfo("无法启动安装器", safeMessage(error)); }
+        try {
+            activity.startActivity(intent);
+            activity.getSharedPreferences(PREFS, Activity.MODE_PRIVATE).edit().clear().apply();
+        } catch (Exception error) { showInfo("无法启动安装器", safeMessage(error)); }
     }
 
     private boolean isAllowedApkUrl(String url) {
-        return url != null && url.startsWith(ALLOWED_APK_PREFIX) && url.endsWith(".apk");
+        try {
+            URL candidate = new URL(url);
+            String path = candidate.getPath();
+            return "https".equalsIgnoreCase(candidate.getProtocol())
+                    && "hljrsa.cn".equalsIgnoreCase(candidate.getHost())
+                    && candidate.getPort() == 50113
+                    && path != null
+                    && path.startsWith("/releases/apps/ic705-remote/")
+                    && path.endsWith(".apk")
+                    && !path.contains("..")
+                    && candidate.getQuery() == null
+                    && candidate.getRef() == null;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private String formatBytes(long bytes) {
@@ -246,6 +334,7 @@ public final class Updater {
     private void report(StatusListener listener, String status) { if (listener != null) ui.post(() -> listener.onStatus(status)); }
     private void showInfo(String title, String message) { showInfo(title, message, null, null); }
     private void showInfo(String title, String message, String positiveText, Runnable action) {
+        if (activity.isFinishing() || (Build.VERSION.SDK_INT >= 17 && activity.isDestroyed())) return;
         new AlertDialog.Builder(activity).setTitle(title).setMessage(message)
                 .setPositiveButton(positiveText == null ? "确定" : positiveText,
                         (dialog, which) -> { if (action != null) action.run(); }).show();

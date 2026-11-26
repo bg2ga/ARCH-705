@@ -32,11 +32,21 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.Timer
 import java.util.TimerTask
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.schedule
+
+internal enum class NetworkRoutePreference { DEFAULT, WIFI }
+
+internal fun chooseNetworkRoute(local: Boolean, onVpn: Boolean, hasWifi: Boolean, hasDefault: Boolean, tryAlternate: Boolean): NetworkRoutePreference =
+    when {
+        !hasDefault -> NetworkRoutePreference.WIFI
+        !local || onVpn -> NetworkRoutePreference.DEFAULT
+        tryAlternate && hasWifi -> NetworkRoutePreference.DEFAULT
+        hasWifi -> NetworkRoutePreference.WIFI
+        else -> NetworkRoutePreference.DEFAULT
+    }
 
 object IcomNet {
     private const val TAG = "IcomNet"                 // logcat tag
@@ -59,7 +69,6 @@ object IcomNet {
 
     private data class Target(val ip: String, val port: Int, val user: String, val password: String,
                               val civPort: Int, val audioPort: Int, val generation: Long)
-    private data class CachedLocalHost(val local: Boolean, val atMs: Long)
     private data class ResolvedTarget(val endpoint: String, val local: Boolean, val resolved: Boolean = true)
     @Volatile private var target: Target? = null      // what to stay connected to (null: not wanted)
     @Volatile private var wifi: Network? = null       // the phone's WiFi network, while up
@@ -70,6 +79,7 @@ object IcomNet {
     @Volatile private var authSucceededMs = 0L
     @Volatile private var retries = 0                 // failed attempts in a row (for the back-off)
     @Volatile private var retryPaused = false         // credentials rejected: wait for the user to edit them
+    @Volatile private var autoLoginSuppressed = false
     @Volatile private var nextTryMs = 0L              // when the next attempt may start
     private var watchdog: Timer? = null               // checks the link every 2 s
     private var cm: ConnectivityManager? = null
@@ -79,9 +89,12 @@ object IcomNet {
     @Volatile private var closing = true
     @Volatile private var activeLocal = false
     @Volatile private var activeRouteUsesWifi = false
-    private val dnsExecutor = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "icom-dns").apply { isDaemon = true }
-    }
+    @Volatile private var activeNetwork: Network? = null
+    private val dnsExecutor = java.util.concurrent.ThreadPoolExecutor(
+        0, 2, 30L, TimeUnit.SECONDS, java.util.concurrent.SynchronousQueue(),
+        { runnable -> Thread(runnable, "icom-dns").apply { isDaemon = true } },
+        java.util.concurrent.ThreadPoolExecutor.DiscardPolicy(),
+    )
     @Volatile private var pttRequested = false
     @Volatile private var powerOnAfterLogin = false
     @Volatile private var powerWakeDeadlineMs = 0L
@@ -89,7 +102,6 @@ object IcomNet {
     @Volatile private var appBackground = false
     @Volatile private var resumeProbeDeadlineMs = 0L
     private var pttSafety: Timer? = null
-    private val localHostCache = ConcurrentHashMap<String, CachedLocalHost>()
     private val connectionGeneration = AtomicLong(0L)
     private val openingGeneration = AtomicLong(0L)
 
@@ -97,8 +109,25 @@ object IcomNet {
     fun connect(ctx: Context, ip: String, port: Int, user: String, password: String,
                 civPort: Int = 50002, audioPort: Int = 50003, powerOn: Boolean = false): Long {
         if (ip.isBlank()) { status.value = "请输入 IC-705 的 IP 地址"; return 0L }
-        synchronized(pttLock) { closing = true }
+        autoLoginSuppressed = false
         val generation = connectionGeneration.incrementAndGet()
+        val oldRig = synchronized(pttLock) {
+            closing = true
+            pttRequested = false
+            rig
+        }
+        // Invalidate old callbacks before the potentially slow stop/unkey path.
+        // Do not hold pttLock while stopping the stream: PTT start takes streamLock then pttLock.
+        uk.hamdigital.audio.VoiceTx.stop()
+        uk.hamdigital.core.TxControl.stopAll()
+        if (oldRig != null) {
+            synchronized(pttLock) {
+                if (rig === oldRig) {
+                    repeat(4) { runCatching { oldRig.quickUnkey() } }
+                    Ic705.pttReleaseSent()
+                }
+            }
+        }
         powerWakeRun.incrementAndGet()
         powerOnAfterLogin = powerOn
         loggedIn = false
@@ -113,16 +142,32 @@ object IcomNet {
         openingGeneration.set(0L)
         watchWifi(ctx.applicationContext)
         Thread({ open() }, "icom-open").start()
-        if (watchdog == null) watchdog = Timer("icom-watchdog", true).apply { schedule(2000, 2000) { check() } }
-        if (pttSafety == null) pttSafety = Timer("ptt-safety", true).apply {
-            scheduleAtFixedRate(object : TimerTask() {
+        if (watchdog == null) {
+            val timer = Timer("icom-watchdog", true)
+            watchdog = timer
+            fun next(): Unit = timer.schedule(object : TimerTask() {
                 override fun run() {
-                    forceUnkeyIfIdle()
+                    try { check() } finally { if (watchdog === timer) next() }
                 }
-            }, 300, 300)
+            }, 2000)
+            next()
+        }
+        if (pttSafety == null) {
+            val timer = Timer("ptt-safety", true)
+            pttSafety = timer
+            fun next(): Unit = timer.schedule(object : TimerTask() {
+                override fun run() {
+                    try { forceUnkeyIfIdle() } finally { if (pttSafety === timer) next() }
+                }
+            }, 300)
+            next()
         }
         return generation
     }
+
+    fun suppressAutoLogin() { autoLoginSuppressed = true }
+    fun autoLoginAllowed(): Boolean = !autoLoginSuppressed
+    fun hasActiveTarget(): Boolean = target != null
 
     fun syncCivAddress(address: Int) {
         if (!loggedIn) {
@@ -134,7 +179,11 @@ object IcomNet {
     /** Stop: log out and do not reconnect. [then] runs once the logout has been sent - stop the background service only
      *  then, or Android cuts the app off the network before the radio hears it leave (0.8.5). */
     fun disconnect(then: (() -> Unit)? = null) {
+        uk.hamdigital.core.PttLock.lock()
         powerOnAfterLogin = false
+        activeNetwork = null
+        activeRouteUsesWifi = false
+        activeLocal = false
         powerWakeRun.incrementAndGet()
         authAcceptedGeneration.value = 0L
         authenticatedGeneration.value = 0L
@@ -154,33 +203,22 @@ object IcomNet {
 
     private fun resolveTarget(host: String): ResolvedTarget {
         val h = host.trim().lowercase()
-        if (h == "localhost" || h.endsWith(".local")) {
-            val ip = runCatching { InetAddress.getByName(h) }.getOrNull()?.hostAddress ?: h
-            return ResolvedTarget(ip, true)
+        val localName = h == "localhost" || h.endsWith(".local")
+        val lookup = try {
+            dnsExecutor.submit<List<InetAddress>> { InetAddress.getAllByName(h).toList() }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            return ResolvedTarget(h, localName, resolved = false)
         }
-        val lookup = dnsExecutor.submit<List<InetAddress>> { InetAddress.getAllByName(h).toList() }
         val addresses = try {
             lookup.get(8, TimeUnit.SECONDS)
         } catch (e: Exception) {
             lookup.cancel(true)
-            return ResolvedTarget(h, false, resolved = false)
+            return ResolvedTarget(h, localName, resolved = false)
         }
-        if (addresses.isEmpty()) return ResolvedTarget(h, false, resolved = false)
+        if (addresses.isEmpty()) return ResolvedTarget(h, localName, resolved = false)
         val ipv4 = addresses.filterIsInstance<Inet4Address>()
         val selected = ipv4.firstOrNull(::isPrivateAddress) ?: ipv4.firstOrNull() ?: addresses.first()
-        return ResolvedTarget(selected.hostAddress ?: h, isPrivateAddress(selected))
-    }
-
-    private fun isLocalRadioHost(host: String): Boolean {
-        val h = host.trim().lowercase()
-        if (h == "localhost" || h.endsWith(".local")) return true
-        val now = System.currentTimeMillis()
-        localHostCache[h]?.takeIf { now - it.atMs < 60_000L }?.let { return it.local }
-        val addresses = runCatching { InetAddress.getAllByName(h) }.getOrNull()
-        if (addresses.isNullOrEmpty()) return false
-        val resolved = addresses.any(::isPrivateAddress)
-        localHostCache[h] = CachedLocalHost(resolved, now)
-        return resolved
+        return ResolvedTarget(selected.hostAddress ?: h, localName || isPrivateAddress(selected))
     }
 
     private fun watchWifi(app: Context) {             // follow the phone's WiFi network - and keep it
@@ -194,14 +232,21 @@ object IcomNet {
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
         c.requestNetwork(req, object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "phone WiFi up: $network"); wifi = network; localHostCache.clear()
-                if (activeRouteUsesWifi && target?.ip?.let(::isLocalRadioHost) == true) c.bindProcessToNetwork(network)
+                wifi = network
                 if (target != null && rig == null) { retries = 0; nextTryMs = 0 }
             }
             override fun onLost(network: Network) {
-                Log.d(TAG, "phone WiFi lost: $network"); localHostCache.clear()
-                if (wifi == network) { wifi = null; c.bindProcessToNetwork(null) }
-                if (target != null && activeLocal && activeRouteUsesWifi) close("手机 Wi-Fi 断开，恢复后自动重连", expectedGeneration = target?.generation)
+                if (wifi == network) wifi = null
+                if (activeNetwork == network) close("当前网络断开，恢复后自动重连", expectedGeneration = target?.generation)
+            }
+        })
+        val vpnRequest = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_VPN).build()
+        c.requestNetwork(vpnRequest, object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (target != null && !activeLocal) close("VPN 已连接，正在切换加密网络", expectedGeneration = target?.generation)
+            }
+            override fun onLost(network: Network) {
+                if (activeNetwork == network) close("VPN 已断开，恢复后自动重连", expectedGeneration = target?.generation)
             }
         })
     }
@@ -225,6 +270,7 @@ object IcomNet {
     private fun openLocked(t: Target, resolved: ResolvedTarget) {
         if (!resolved.resolved) {
             status.value = "地址解析超时，请检查网络或 DNS"
+            scheduleRetry()
             return
         }
         val local = resolved.local
@@ -233,40 +279,33 @@ object IcomNet {
         synchronized(pttLock) { closing = true }
         closeNow(null, expected = rig)                   // (any earlier attempt)
         if (target !== t || connectionGeneration.get() != t.generation) return
-        val activeNetwork = cm?.activeNetwork
-        val activeCaps = activeNetwork?.let { cm?.getNetworkCapabilities(it) }
-        val onVpn = activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-        val wifiNetwork = wifi ?: activeNetwork?.takeIf {
+        cm?.bindProcessToNetwork(null)
+        val defaultNetwork = cm?.activeNetwork
+        val defaultCaps = defaultNetwork?.let { cm?.getNetworkCapabilities(it) }
+        val onVpn = defaultCaps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        val wifiNetwork = wifi ?: defaultNetwork?.takeIf {
             cm?.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         }
-        val w = when {
-            !local -> activeNetwork
-            onVpn -> activeNetwork
-            else -> wifiNetwork ?: activeNetwork
-        }
+        val alternate = defaultNetwork != null && wifiNetwork != null && defaultNetwork != wifiNetwork
+        val preference = chooseNetworkRoute(local, onVpn, wifiNetwork != null, defaultNetwork != null, retries % 2 == 1 && alternate)
+        val w = if (preference == NetworkRoutePreference.WIFI) wifiNetwork ?: defaultNetwork else defaultNetwork ?: wifiNetwork
         if (w == null) {
             status.value = if (local) "等待手机 Wi-Fi、VPN 或可用网络" else "等待手机网络"
             return
         }
-        activeRouteUsesWifi = local && !onVpn && wifiNetwork != null
-        if (activeRouteUsesWifi) {
-            wifi = wifiNetwork
-            cm?.bindProcessToNetwork(wifiNetwork)
-        } else {
-            cm?.bindProcessToNetwork(null)
-        }
+        activeNetwork = w
+        activeRouteUsesWifi = !onVpn && w == wifiNetwork
         status.value = if (retries == 0) "正在直连 ${t.ip}…" else "正在直连 ${t.ip}（第 ${retries + 1} 次）…"
-        Log.d(TAG, "open ${t.ip}:${t.port} try ${retries + 1}")
-        val r = IComWifiRig(resolved.endpoint, t.port, t.user, t.password, t.civPort, t.audioPort)
+        if (uk.hamdigital.BuildConfig.DEBUG) Log.d(TAG, "open ${t.ip}:${t.port} try ${retries + 1}")
+        val r = IComWifiRig(resolved.endpoint, t.port, t.user, t.password, t.civPort, t.audioPort, w)
         r.onStatus = WifiRig.OnStatus { msg, ok ->   // login and network messages
             if (r !== rig || target !== t || connectionGeneration.get() != t.generation) return@OnStatus
-            Log.d(TAG, "status: $msg ($ok)")
+            if (uk.hamdigital.BuildConfig.DEBUG) Log.d(TAG, "status: $msg ($ok)")
             if (ok) {
-                val audioUdp = r.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp
-                if ((audioUdp?.lastAudioPacketMs ?: 0L) > 0L) {
+                if (!loggedIn && civReady(r)) {
                     markLoggedIn(t, r, msg)
                 } else if (!loggedIn) {
-                    status.value = "认证成功，正在等待音频通道…"
+                    status.value = "认证成功，正在等待串口/音频通道…"
                     authAcceptedGeneration.value = t.generation
                     if (!authSucceeded) {
                         authSucceeded = true
@@ -309,7 +348,7 @@ object IcomNet {
                     lastCivMs = System.currentTimeMillis(); civSeen = true; observeCivLatency(data); parseScope(data); Ic705.netFrame(data)
                 }
             }
-            override fun onReceivedWaveData(data: ByteArray) {                     // receive audio: 12 kHz 16-bit little-endian
+            override fun onReceivedWaveData(data: ByteArray) {
                 if (r !== rig || target !== t || connectionGeneration.get() != t.generation) return
                 val n = data.size / 2; val s = ShortArray(n) { i -> ((data[2 * i].toInt() and 0xFF) or (data[2 * i + 1].toInt() shl 8)).toShort() }
                 AudioIn.netAudio(s, n)
@@ -456,20 +495,15 @@ object IcomNet {
 
     private fun scheduleRetry() {
         retries++
-        nextTryMs = System.currentTimeMillis() + minOf(5_000L + retries * 1_000L, 10_000L)
+        val exponent = minOf(retries - 1, 4)
+        val delay = minOf(5_000L * (1L shl exponent), 60_000L)
+        nextTryMs = System.currentTimeMillis() + delay
     }
 
     private fun check() {                             // the watchdog (every 2 s)
         val t = target ?: return
         val generation = t.generation
         val now = System.currentTimeMillis()
-        if (appBackground && rig != null) {
-            if (loggedIn && civSeen && now - lastCivMs > 20_000L && now > powerWakeDeadlineMs) {
-                close("后台电台链路超时，正在重连", expectedGeneration = generation)
-                scheduleRetry()
-            }
-            return
-        }
         if (rig != null && now < resumeProbeDeadlineMs) return
         when {
             rig == null -> if (!retryPaused && now >= nextTryMs) open()
@@ -605,29 +639,31 @@ object IcomNet {
     }
 
     /** PTT, with duplicated edge commands because Icom LAN UDP has no command acknowledgement. */
-    fun ptt(on: Boolean) {
+    fun ptt(on: Boolean): Boolean {
         synchronized(pttLock) {
             val r = rig
             if (on && (r == null || !loggedIn || closing || target == null)) {
                 pttRequested = false
                 runCatching { r?.quickUnkey() }
-                return
+                return false
             }
+            if (r == null || !civReady(r)) return false
             pttRequested = on
-            if (r != null && civReady(r)) {
-                repeat(if (on) 3 else 4) {
-                    runCatching { r.setPttOn(on) }
-                    try { Thread.sleep(25) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
-                }
-                if (!on) {
-                    (r.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.stopTxStream()
-                }
+            var sent = false
+            repeat(if (on) 3 else 4) {
+                if (runCatching { r.setPttOn(on) }.isSuccess) sent = true
+                try { Thread.sleep(25) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
             }
+            if (!on) {
+                (r.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.stopTxStream()
+            }
+            return sent
         }
     }
 
     /** Soft power off over CI-V, then close the remote session so it cannot reconnect. */
     fun powerOff() {
+        uk.hamdigital.core.PttLock.lock()
         uk.hamdigital.core.TxControl.stopAll()
         forceUnkey()
         try {
@@ -665,9 +701,10 @@ object IcomNet {
     /** Safety watchdog path: re-check under the same lock so a new legal PTT cannot be cancelled. */
     private fun forceUnkeyIfIdle() {
         synchronized(pttLock) {
-            if (pttRequested || closing || target == null || !Ic705.state.value.tx) return
+            val r = rig ?: return
+            if (pttRequested || !Ic705.state.value.tx) return
             pttRequested = false
-            repeat(4) { runCatching { rig?.quickUnkey() } }
+            repeat(4) { runCatching { r.quickUnkey() } }
             Ic705.pttReleaseSent()
         }
     }
@@ -691,16 +728,24 @@ object IcomNet {
     fun sendAudio(samples: FloatArray): Boolean {
         val r = rig ?: return false
         if (!txAudioReady()) return false
-        r.sendWaveData(samples)
-        return true
+        return runCatching { r.sendWaveData(samples) }.isSuccess
     }
+    fun oneShotActive(): Boolean = (rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.isOneShotActive ?: false
+    fun oneShotPackets(): Long = (rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.oneShotPacketCount() ?: -1L
 
-    /** Streamed transmit audio (FreeDV voice, made as it goes): start sending the queue - PTT must be on - ... */
     fun streamAvailable(): Boolean = txAudioReady()
-    fun streamStart() { val r = rig ?: return; if (txAudioReady()) (r.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.startTxStream() }
-    /** ... queue 12 kHz 16-bit samples ... */
+    fun streamStart(): Boolean {
+        if (!txAudioReady()) return false
+        val audio = rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp ?: return false
+        return audio.startTxStream() && audio.isTxStreaming
+    }
+    fun streamHealthy(): Boolean {
+        if (closing || !loggedIn || target == null) return false
+        val audio = rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp ?: return false
+        return audio.isTxStreaming
+    }
+    fun streamPackets(): Long = (rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.txStreamPackets() ?: -1L
     fun streamPush(s: ShortArray, n: Int) { val r = rig ?: return; if (!closing && target != null) (r.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.pushTxAudio(s, n) }
-    /** ... (samples still waiting in the queue) ... */
     fun streamQueued(): Int = (rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.txQueued() ?: 0
     /** Receive audio packets: [received, filled with silence (lost), recovered (asked for again), too late] - null when not on WiFi. */
     fun rxAudioStats(): LongArray? = (rig?.controlUdp?.audioUdp as? uk.hamdigital.icom.IcomAudioUdp)?.let { longArrayOf(it.rxPackets, it.rxLost, it.rxRecovered, it.rxLate) }

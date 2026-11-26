@@ -12,12 +12,15 @@ object AudioOut {
     val error = MutableStateFlow<String?>(null)
     @Volatile private var track: AudioTrack? = null
     @Volatile private var outputRate = 0
+    @Volatile private var inputRate = 0
     @Volatile private var paused = false
+    private val owners = mutableSetOf<Any>()
     private var resamplePos = 0.0
     private var previous = 0
 
     @Synchronized
-    fun open(): String? {
+    fun open(owner: Any? = null): String? {
+        if (owner != null) owners.add(owner)
         if (track != null) {
             if (paused) {
                 runCatching { track?.play() }
@@ -50,6 +53,7 @@ object AudioOut {
                 t.play()
                 track = t
                 outputRate = rate
+                inputRate = 0
                 paused = false
                 resamplePos = 0.0
                 previous = 0
@@ -66,10 +70,20 @@ object AudioOut {
     }
 
     @Synchronized
-    fun close() {
+    fun close(owner: Any? = null) {
+        if (owner != null) {
+            owners.remove(owner)
+            if (owners.isNotEmpty()) return
+        } else owners.clear()
+        releaseTrack()
+        error.value = null
+    }
+
+    private fun releaseTrack() {
         val t = track
         track = null
         outputRate = 0
+        inputRate = 0
         paused = false
         resamplePos = 0.0
         previous = 0
@@ -93,23 +107,32 @@ object AudioOut {
     fun resume() {
         if (track == null) { open(); return }
         if (paused) {
-            runCatching { track?.play() }
-            paused = false
+            val result = runCatching { track?.play() }
+            if (result.isSuccess && track?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                paused = false
+            } else {
+                error.value = "音频输出恢复失败：" + (result.exceptionOrNull()?.message ?: "播放器未进入播放状态")
+            }
         }
     }
 
-    /** Accepts the protocol's 12 kHz mono PCM and converts it to the device's working rate. */
+    /** Accepts protocol receive PCM at its native rate and converts it to the device's working rate. */
     @Synchronized
-    fun write12k(samples: ShortArray, count: Int) {
+    fun writePcm(samples: ShortArray, count: Int, sampleRate: Int) {
         if (paused) return
         val out = track ?: return
-        if (count <= 0 || outputRate <= 0) return
+        if (count <= 0 || outputRate <= 0 || sampleRate <= 0) return
+        if (inputRate != sampleRate) {
+            inputRate = sampleRate
+            resamplePos = 0.0
+            previous = 0
+        }
         try {
-            if (outputRate == 12000) {
+            if (outputRate == sampleRate) {
                 writeAvailable(out, samples, count)
                 return
             }
-            val step = 12000.0 / outputRate
+            val step = sampleRate.toDouble() / outputRate
             val target = (count / step).toInt() + 1
             val converted = ShortArray(target)
             var at = 0
@@ -129,21 +152,32 @@ object AudioOut {
         } catch (e: Exception) {
             error.value = "音频输出异常：${e.message ?: "未知错误"}"
             Log.w(TAG, error.value!!)
+            releaseTrack()
         }
     }
 
+    fun write12k(samples: ShortArray, count: Int) = writePcm(samples, count, 12000)
+
     private fun writeAvailable(out: AudioTrack, data: ShortArray, count: Int) {
+        if (out.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            val result = runCatching { out.play() }
+            if (result.isFailure || out.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                fail("播放器未能启动：" + (result.exceptionOrNull()?.message ?: "未知错误"))
+                return
+            }
+        }
+        runCatching { out.setVolume(1f) }
         var offset = 0
         var retries = 0
         while (offset < count) {
             val written = out.write(data, offset, count - offset, AudioTrack.WRITE_NON_BLOCKING)
             if (written == AudioTrack.ERROR_DEAD_OBJECT) {
                 Log.w(TAG, "音频输出对象失效，正在重建")
-                close()
+                releaseTrack()
                 open()
                 return
             }
-            if (written < 0) { fail(written); return }
+            if (written < 0) { fail("音频写入失败（$written）"); return }
             if (written == 0) {
                 if (++retries > 2) return
                 Thread.sleep(2)
@@ -154,9 +188,9 @@ object AudioOut {
         }
     }
 
-    private fun fail(code: Int) {
-        error.value = "音频输出异常（$code）"
-        Log.w(TAG, "音频输出失败：$code")
-        close()
+    private fun fail(message: String) {
+        releaseTrack()
+        error.value = message
+        Log.w(TAG, message)
     }
 }

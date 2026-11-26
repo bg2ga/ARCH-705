@@ -172,8 +172,8 @@ fun ArchNavAction(text: String, onClick: () -> Unit) {
                 Modifier
                     .clip(ArchPillShape)
                     .background(Color.White.copy(alpha = 0.08f))
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
-            ) { uk.hamdigital.ui.Text(text, color = Pal.Text, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                    .padding(horizontal = 9.dp, vertical = 6.dp),
+            ) { uk.hamdigital.ui.Text(text, color = Pal.Text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
         }
     }
 }

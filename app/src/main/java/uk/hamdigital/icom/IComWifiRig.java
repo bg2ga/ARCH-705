@@ -6,6 +6,7 @@ package uk.hamdigital.icom;
  */
 
 import android.media.AudioTrack;
+import android.net.Network;
 
 import uk.hamdigital.icom.IcomUdpBase.IcomUdpStyle;
 
@@ -16,18 +17,21 @@ public class IComWifiRig extends WifiRig{
     private final int audioRigPortOverride;
     private volatile boolean closed = false;
 
+    private final Network preferredNetwork;
+
     public IComWifiRig(String ip, int port, String userName, String password,
-                       int civRigPortOverride, int audioRigPortOverride) {
+                       int civRigPortOverride, int audioRigPortOverride, Network preferredNetwork) {
         super(ip,port,userName,password);
         this.civRigPortOverride = civRigPortOverride;
         this.audioRigPortOverride = audioRigPortOverride;
+        this.preferredNetwork = preferredNetwork;
     }
 
     @Override
     public void start(){
         if (closed) return;
         opened=true;
-        controlUdp=new IcomControlUdp(userName,password,ip,port,civRigPortOverride,audioRigPortOverride);
+        controlUdp=new IcomControlUdp(userName,password,ip,port,civRigPortOverride,audioRigPortOverride,preferredNetwork);
         if (!opened) { controlUdp.closeAll(); return; }
 
         //设置事件，这里可以处理电台状态，和接收电台送来的音频数据

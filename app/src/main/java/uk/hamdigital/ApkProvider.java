@@ -40,7 +40,7 @@ public final class ApkProvider extends ContentProvider {
 
     @Override
     public String getType(Uri uri) {
-        return "application/vnd.android.package-archive";
+        return resolve(uri) == null ? null : "application/vnd.android.package-archive";
     }
 
     @Override
